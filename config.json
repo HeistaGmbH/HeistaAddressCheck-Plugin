@@ -1,0 +1,151 @@
+{
+  "formatVersion": 1,
+  "menu": {
+    "connection": {
+      "label": "Config.sectionConnection",
+      "formFields": {
+        "environment": {
+          "type": "selectBox",
+          "required": true,
+          "label": "Config.environmentLabel",
+          "options": {
+            "tooltip": "Config.environmentTooltip",
+            "defaultValue": "production",
+            "selectBoxValues": [
+              { "value": "production",  "caption": "Config.environmentProduction" },
+              { "value": "development", "caption": "Config.environmentDevelopment" }
+            ]
+          }
+        },
+        "apiKey": {
+          "type": "inputText",
+          "required": true,
+          "label": "Config.apiKeyLabel",
+          "options": {
+            "tooltip": "Config.apiKeyTooltip",
+            "isPassword": true,
+            "defaultValue": ""
+          }
+        },
+        "callbackSecret": {
+          "type": "inputText",
+          "required": true,
+          "label": "Config.callbackSecretLabel",
+          "options": {
+            "tooltip": "Config.callbackSecretTooltip",
+            "isPassword": true,
+            "defaultValue": ""
+          }
+        },
+        "pluginCallbackBaseUrl": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.pluginCallbackBaseUrlLabel",
+          "options": {
+            "tooltip": "Config.pluginCallbackBaseUrlTooltip",
+            "defaultValue": ""
+          }
+        }
+      }
+    },
+    "statusMapping": {
+      "label": "Config.sectionStatusMapping",
+      "formFields": {
+        "statusOnCorrected": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnCorrectedLabel",
+          "options": {
+            "tooltip": "Config.statusOnCorrectedTooltip",
+            "defaultValue": ""
+          }
+        },
+        "statusOnManualReview": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnManualReviewLabel",
+          "options": {
+            "tooltip": "Config.statusOnManualReviewTooltip",
+            "defaultValue": ""
+          }
+        },
+        "statusOnInvalid": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnInvalidLabel",
+          "options": {
+            "tooltip": "Config.statusOnInvalidTooltip",
+            "defaultValue": ""
+          }
+        },
+        "statusOnNotFound": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnNotFoundLabel",
+          "options": {
+            "tooltip": "Config.statusOnNotFoundTooltip",
+            "defaultValue": ""
+          }
+        },
+        "commentAuthorUserId": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.commentAuthorUserIdLabel",
+          "options": {
+            "tooltip": "Config.commentAuthorUserIdTooltip",
+            "defaultValue": ""
+          }
+        }
+      }
+    },
+    "shippingMapping": {
+      "label": "Config.sectionShippingMapping",
+      "formFields": {
+        "dhlProfileIds": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.dhlProfileIdsLabel",
+          "options": {
+            "tooltip": "Config.dhlProfileIdsTooltip",
+            "defaultValue": ""
+          }
+        },
+        "dpdProfileIds": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.dpdProfileIdsLabel",
+          "options": {
+            "tooltip": "Config.dpdProfileIdsTooltip",
+            "defaultValue": ""
+          }
+        }
+      }
+    },
+    "dev": {
+      "label": "Config.sectionDev",
+      "deprecated": true,
+      "formFields": {
+        "devApiBaseUrlOverride": {
+          "type": "inputText",
+          "required": false,
+          "deprecated": true,
+          "label": "Config.devApiBaseUrlOverrideLabel",
+          "options": {
+            "tooltip": "Config.devApiBaseUrlOverrideTooltip",
+            "defaultValue": ""
+          }
+        },
+        "devN8nEndpointOverride": {
+          "type": "inputText",
+          "required": false,
+          "deprecated": true,
+          "label": "Config.devN8nEndpointOverrideLabel",
+          "options": {
+            "tooltip": "Config.devN8nEndpointOverrideTooltip",
+            "defaultValue": ""
+          }
+        }
+      }
+    }
+  }
+}

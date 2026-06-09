@@ -1,0 +1,21 @@
+{
+  "name": "HeistaAddressCheck",
+  "namespace": "HeistaAddressCheck",
+  "phpNamespace": "HeistaAddressCheck",
+  "type": "integration",
+  "version": "1.0.0",
+  "description": "Validates and corrects order delivery addresses via the Heista SaaS platform. Submits each tagged order to the platform on creation, applies corrections via webhook (fast path) or cron-poll (fallback).",
+  "shortDescription": "Address validation via Heista SaaS",
+  "author": "Heista",
+  "email": "support@heista.io",
+  "license": "MIT",
+  "authorIcon": "icon_author.png",
+  "pluginIcon": "icon_plugin.png",
+  "platform": {
+    "php": ">=8.0"
+  },
+  "serviceProvider": "HeistaAddressCheck\\Providers\\AddressCheckServiceProvider",
+  "runOnBuild": [
+    "HeistaAddressCheck\\Migrations\\CreatePendingAddressCheckTable"
+  ]
+}
