@@ -13,10 +13,9 @@ use Plenty\Plugin\Log\Loggable;
 use Throwable;
 
 /**
- * Fallback when the inbound webhook from the SaaS does not arrive (firewall, retry budget exhausted, etc.).
- *
- * Plenty's most frequent built-in cron slot is every 5 minutes. The webhook is the fast path;
- * this cron is the safety net so no order silently stalls.
+ * Polls for completed jobs when the webhook callback never arrives (firewall,
+ * exhausted retries, etc.). Runs on Plenty's 5-minute cron slot as the backup
+ * to the webhook fast path.
  */
 class FallbackPollCron extends CronHandler
 {
@@ -79,7 +78,7 @@ class FallbackPollCron extends CronHandler
             } elseif ($status === 'FAILED') {
                 $this->pendingRepo->markFailed($row, 'SaaS job FAILED');
             }
-            // Other states (PENDING, PROCESSING, AWAITING_EXTERNAL): leave untouched, retry next tick.
+            // Anything else (PENDING/PROCESSING/AWAITING_EXTERNAL): retry next tick.
         }
     }
 

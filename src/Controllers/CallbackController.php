@@ -52,10 +52,6 @@ class CallbackController extends Controller
             $this->getLogger(__METHOD__)->debug('HeistaAddressCheck::log.callbackUnauthorized', [
                 'remoteIp'     => $remoteIp,
                 'secretSource' => $secretSource,
-                'expectedLen'  => strlen($expectedSecret),
-                'providedLen'  => strlen($providedSecret),
-                'expectedSha1' => substr(sha1($expectedSecret), 0, 8),
-                'providedSha1' => substr(sha1($providedSecret), 0, 8),
             ]);
             return $response->json(['error' => 'invalid secret'], 401);
         }
@@ -84,7 +80,7 @@ class CallbackController extends Controller
                 'jobId' => $jobId,
                 'error' => $e->getMessage(),
             ]);
-            // Still return 200 so the platform doesn't retry forever — the cron will catch it.
+            // Return 200 anyway so the platform stops retrying; the cron catches it.
         }
 
         return $response->json(['received' => true]);

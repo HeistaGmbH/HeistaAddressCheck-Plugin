@@ -57,10 +57,9 @@ class AddressCheckSubmitService
         $devOverride = trim((string) $this->config->get('HeistaAddressCheck.devApiBaseUrlOverride'));
         $apiBaseUrl  = PlatformEnvironment::baseUrlFor($environment, $devOverride);
 
-        // Optional internal n8n endpoint override — sent to the platform as
-        // `config._n8nEndpoint` so it routes this shop's checks to an
-        // alternate n8n webhook (e.g. "address-check-2") instead of the
-        // default workflow. Leave empty in production.
+        // Optional endpoint override, sent as config._n8nEndpoint to route this
+        // shop to an alternate backend workflow instead of the default. Leave
+        // empty in production.
         $n8nEndpointOverride = trim((string) $this->config->get('HeistaAddressCheck.devN8nEndpointOverride'));
 
         try {
@@ -73,9 +72,9 @@ class AddressCheckSubmitService
             return;
         }
 
-        // Resolve which Heista-defined shipping provider this order ships with,
-        // so the platform can route it to a carrier-specific n8n cleanup prompt.
-        // Unmapped profiles resolve to '' → platform uses the generic prompt.
+        // Resolve the order's shipping carrier so the backend can pick a
+        // carrier-specific cleanup prompt. Unmapped profiles send '' and get
+        // the generic prompt.
         $shippingProfileId = $this->resolveShippingProfileId($order);
         $shippingProvider  = $this->resolveShippingProviderKey($shippingProfileId);
 
@@ -126,8 +125,8 @@ class AddressCheckSubmitService
         if ($configured !== '') {
             return rtrim($configured, '/') . '/address-check/callback';
         }
-        // Fallback: relative path. The platform requires https, so the operator
-        // must set pluginCallbackBaseUrl for the fast-path webhook to work.
+        // Relative fallback. The API requires https, so pluginCallbackBaseUrl
+        // has to be set for the webhook callback to actually work.
         return '/address-check/callback';
     }
 
@@ -142,11 +141,10 @@ class AddressCheckSubmitService
             }
         }
 
-        // Plenty's Address model exposes the same logical fields under two
-        // parallel columns: typed (street/companyName/firstName/...) and
-        // numbered (address1..4 / name1..4). Different shops populate
-        // different sets, so read both. `?:` (truthy) not `??` (null-only)
-        // because Plenty stores "" rather than null for unset fields.
+        // Plenty's Address has two parallel column sets for the same fields:
+        // named (street/companyName/firstName/...) and numbered (address1..4/
+        // name1..4). Shops populate different sets, so fall back across both.
+        // Use ?: not ?? because Plenty stores "" (not null) for empty fields.
         $item = [
             'addressId'     => (string) ($address->id ?? ''),
             'street'        => (string) ($address->street      ?: ($address->address1 ?: '')),
@@ -163,9 +161,8 @@ class AddressCheckSubmitService
             'isPackstation' => (bool)   ($address->isPackstation ?? false),
             'isPostfiliale' => (bool)   ($address->isPostfiliale ?? false),
             'postnumber'    => (string) ($address->packstationNo ?: ''),
-            // Carrier routing key (dhl/dpd/…) resolved from the order's shipping
-            // profile. Empty when unmapped → platform falls back to the generic
-            // n8n cleanup prompt. Must match the n8n Provider Router keys.
+            // Carrier key (dhl/dpd/...) from the shipping profile; empty when
+            // unmapped. Must match the provider keys the backend expects.
             'shippingProvider' => $shippingProvider,
         ];
 
@@ -184,12 +181,11 @@ class AddressCheckSubmitService
     }
 
     /**
-     * Read the order's shipping profile ID.
+     * Get the order's shipping profile ID.
      *
-     * Prefers the direct `shippingProfileId` field; falls back to the order
-     * property of type SHIPPING_PROFILE (typeId 2), which is where Plenty also
-     * stores it and which is sometimes the only populated source at the
-     * order-created event. Returns 0 when neither yields a positive integer.
+     * Prefers $order->shippingProfileId, falls back to the SHIPPING_PROFILE
+     * order property (typeId 2), which is sometimes the only one populated at
+     * the order-created event. Returns 0 if neither is a positive int.
      */
     private function resolveShippingProfileId(Order $order): int
     {
@@ -219,12 +215,9 @@ class AddressCheckSubmitService
     }
 
     /**
-     * Map a Plenty shipping-profile ID to a Heista-defined provider routing key.
-     *
-     * Providers are defined by us and must match the n8n workflow's Provider
-     * Router keys. Precedence is fixed (dhl, then dpd): the first carrier whose
-     * configured ID list contains the profile wins. Returns '' when the profile
-     * is unmapped, so the platform falls back to the generic cleanup prompt.
+     * Map a shipping-profile ID to a carrier key (must match what the backend
+     * expects). Fixed precedence, dhl then dpd: the first carrier whose
+     * configured ID list contains the profile wins. Returns '' when unmapped.
      */
     private function resolveShippingProviderKey(int $profileId): string
     {

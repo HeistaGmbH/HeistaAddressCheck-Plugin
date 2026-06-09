@@ -7,8 +7,8 @@
   "description": "Validates and corrects order delivery addresses via the Heista SaaS platform. Submits each tagged order to the platform on creation, applies corrections via webhook (fast path) or cron-poll (fallback).",
   "shortDescription": "Address validation via Heista SaaS",
   "author": "Heista",
-  "email": "support@heista.io",
-  "license": "MIT",
+  "email": "support@heista.de",
+  "license": "Proprietary",
   "authorIcon": "icon_author.png",
   "pluginIcon": "icon_plugin.png",
   "platform": {

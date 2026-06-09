@@ -18,10 +18,10 @@ use Plenty\Plugin\Log\Reportable;
 use Throwable;
 
 /**
- * Single seam used by both the webhook controller and the fallback cron.
+ * Shared apply path for both the webhook controller and the fallback cron.
  *
- * Idempotency: if the row is already APPLIED or FAILED, apply() is a no-op.
- * Whichever path arrives second silently exits without re-writing the address.
+ * Idempotent: if the pending row is already APPLIED or FAILED, apply() does
+ * nothing, so whichever of the two paths arrives second just exits.
  */
 class AddressCheckApplyService
 {
@@ -55,11 +55,10 @@ class AddressCheckApplyService
     }
 
     /**
-     * @param string $jobId  SaaS job id (UUID).
-     * @param array  $body   The platform's job-completion body. Either the V1 GET
-     *                       /api/v1/jobs/{id} response (cron path) or the inbound
-     *                       webhook body (controller path); both share shape:
-     *                       { jobId, status, externalRef, items: [...] }.
+     * @param string $jobId  Job id (UUID).
+     * @param array  $body   Job-completion body. Either the GET /api/v1/jobs/{id}
+     *                       response (cron path) or the webhook body (controller
+     *                       path); both share { jobId, status, externalRef, items }.
      */
     public function apply(string $jobId, array $body): void
     {
@@ -70,7 +69,7 @@ class AddressCheckApplyService
         }
 
         if ($row->status !== PendingAddressCheck::STATUS_PENDING) {
-            // Already settled — webhook + cron racing is normal, this is the no-op leg.
+            // Already settled. Webhook and cron racing here is expected; just exit.
             return;
         }
 
@@ -78,9 +77,8 @@ class AddressCheckApplyService
         $item      = $body['items'][0] ?? null;
         $orderId   = (int) $row->orderId;
 
-        // Job-level failures: don't touch order status (a SaaS-side bug shouldn't
-        // silently route the merchant's order somewhere). Just record the
-        // pending row as failed so the operator can see what happened.
+        // Job-level failure: leave the order status alone (a backend bug
+        // shouldn't reroute the merchant's order) and just mark the row failed.
         if ($jobStatus !== 'COMPLETED') {
             $itemError = is_array($item) ? (string) ($item['error'] ?? '') : '';
             $reason    = 'Job ended with status ' . $jobStatus;
@@ -102,18 +100,15 @@ class AddressCheckApplyService
         $corrected    = $output['corrected'] ?? null;
         $input        = is_array($item) ? ($item['input'] ?? null) : null;
 
-        // Resolve the merchant's configured target order-status for this
-        // outcome up-front, regardless of whether we end up applying the
-        // address. Empty / non-numeric values are skipped silently.
+        // Resolve the configured target status for this outcome up front,
+        // whether or not we apply the address. Empty/non-numeric is skipped.
         $targetStatusId = $this->resolveTargetStatusId($outputStatus);
 
-        // Apply the corrected address whenever Heista flagged the result as
-        // valid AND returned a structured corrected payload. This covers both
-        // 'corrected' (clean fix) and 'manual_review' (LLM cleaned the address
-        // but Google flagged it for human review). The configured review
-        // status still routes the order into the merchant's triage queue, and
-        // the original address is preserved as an internal order comment so
-        // the operator can revert if Heista's correction is wrong.
+        // Apply the correction whenever the result is valid and a structured
+        // corrected payload came back. Covers both 'corrected' and
+        // 'manual_review' (cleaned but flagged for a human). We still set the
+        // configured status and keep the original address as an internal
+        // comment so the merchant can revert a bad correction.
         $shouldApplyAddress = $isValid && is_array($corrected);
 
         if ($shouldApplyAddress) {
@@ -127,10 +122,9 @@ class AddressCheckApplyService
                         AddressRelationType::DELIVERY_ADDRESS
                     );
 
-                    // Soft-fail: comment is supplementary, don't roll the
-                    // address apply back if comment creation throws. Logged
-                    // at error level so the failure is visible without
-                    // having to activate plugin debug logging.
+                    // Comment is supplementary: if it throws, don't roll back
+                    // the address apply. Logged at error level so it shows up
+                    // without enabling debug logging.
                     $authorUserId = $this->resolveCommentAuthorUserId();
                     if (!is_array($input)) {
                         $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentSkippedNoInput', [
@@ -174,9 +168,9 @@ class AddressCheckApplyService
                         }
                     }
 
-                    // Status update inside the same processUnguarded so we don't
-                    // re-auth. Soft-fail: address was already saved, so a bad
-                    // statusId shouldn't roll the apply back.
+                    // Status update in the same processUnguarded to avoid
+                    // re-auth. Address is already saved, so a bad statusId
+                    // shouldn't roll it back.
                     if ($targetStatusId !== null) {
                         $this->updateOrderStatus($orderId, $targetStatusId);
                     }
@@ -204,11 +198,10 @@ class AddressCheckApplyService
             return;
         }
 
-        // No usable correction: either Heista marked the address invalid, or
-        // no corrected payload was returned. Don't touch the address, but
-        // still apply the configured status so the merchant can route the
-        // order into a review queue. Pending row is marked FAILED to reflect
-        // "address not applied".
+        // No usable correction (invalid, or no corrected payload). Leave the
+        // address as-is but still set the configured status so the merchant
+        // can route it to a review queue. Row is marked FAILED to reflect that
+        // the address wasn't applied.
         if ($targetStatusId !== null) {
             try {
                 $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId): void {
@@ -229,17 +222,12 @@ class AddressCheckApplyService
     }
 
     /**
-     * Persist the originally submitted delivery address as an internal order
-     * comment (not visible to the customer) so the merchant can see what was
-     * overwritten and revert if Heista's correction is wrong. Caller wraps in
-     * processUnguarded.
+     * Save the original delivery address as an internal order comment (hidden
+     * from the customer) so the merchant can see what was overwritten and
+     * revert a bad correction. Caller wraps this in processUnguarded.
      *
-     * Payload shape mirrors the REST POST /rest/comments contract:
-     *   - `referenceValue` is sent as **int** (despite the model's untyped
-     *     property), `userId` must be a positive integer (the merchant
-     *     configures this — `0` and absence both trigger "validation error
-     *     found"), `text` is **HTML** (Plenty wraps plain text in `<p>` tags
-     *     elsewhere; we send the same shape).
+     * Matches the /rest/comments contract: referenceValue as int, userId a
+     * positive integer (0 or missing both fail validation), text as HTML.
      */
     private function createOriginalAddressComment(int $orderId, array $input, string $outputStatus, string $jobId, int $authorUserId): int
     {
@@ -255,10 +243,9 @@ class AddressCheckApplyService
     }
 
     /**
-     * Read the merchant-configured author user id for plugin-generated order
-     * comments. Returns null when unconfigured or non-positive — the caller
-     * skips comment creation rather than send an invalid payload (Plenty's
-     * comment endpoint rejects userId=0 with "validation error found").
+     * Configured author user id for plugin-created comments. Returns null when
+     * unset or non-positive; the caller then skips the comment instead of
+     * sending userId=0, which the comment endpoint rejects.
      */
     private function resolveCommentAuthorUserId(): ?int
     {
@@ -271,19 +258,16 @@ class AddressCheckApplyService
     }
 
     /**
-     * HTML comment body — Plenty stores the rich-text editor's output as
-     * HTML and validates accordingly, so we wrap our snapshot the same way.
-     * Empty fields are skipped so the comment stays readable. German labels —
-     * order comments aren't translated by Plenty and the plugin's audience is
-     * German merchants. Field values are HTML-escaped in case the merchant's
-     * customer entered angle brackets.
+     * Build the HTML comment body. Plenty stores comments as HTML and validates
+     * them that way, so we emit HTML. Empty fields are skipped. Labels are
+     * German on purpose (comments aren't translated and the audience is German
+     * merchants). Values are escaped in case a customer entered angle brackets.
      */
     private function formatOriginalAddressComment(array $input, string $outputStatus, string $jobId): string
     {
-        // postnumber is intentionally omitted from this list — Plenty stores
-        // a per-customer "post number" alongside every address but it only
-        // makes sense for Packstation / Postfiliale deliveries. We render it
-        // below, gated on the relevant flag.
+        // postnumber is intentionally not in this list: Plenty keeps a post
+        // number on every address, but it only matters for Packstation/
+        // Postfiliale. It's rendered below, gated on those flags.
         $labels = [
             'company'      => 'Firma',
             'firstName'    => 'Vorname',
@@ -331,10 +315,9 @@ class AddressCheckApplyService
     }
 
     /**
-     * Look up the merchant's configured order-status target for the given
-     * address-check outcome. Returns null when the field is empty, missing, or
-     * not a positive number — empty / unparseable values mean "leave the
-     * order's status alone" rather than "fail loudly".
+     * Configured target order status for a given outcome. Returns null when the
+     * field is empty, missing, or not a positive number; that means "leave the
+     * status alone" rather than failing.
      */
     private function resolveTargetStatusId(string $outputStatus): ?float
     {
@@ -353,7 +336,7 @@ class AddressCheckApplyService
         }
 
         // Plenty status IDs are decimals like "5.1", "7", "8.4". Reject
-        // anything else with a warning so a typo'd config doesn't silently
+        // anything else with a warning so a typo'd config doesn't quietly
         // corrupt order routing.
         if (!is_numeric($raw)) {
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.statusIdInvalid', [
@@ -381,11 +364,10 @@ class AddressCheckApplyService
 
     private function mapCorrectedToPlentyFields(array $corrected): array
     {
-        // Plenty stores the displayed address in the LEGACY numbered columns
-        // (name1..4, address1..4). The modern named columns (companyName,
-        // firstName, street, houseNumber, additional) live alongside but the
-        // backend order view reads the legacy ones, so we have to write those.
-        // Mirrors the proven n8n PUT to /rest/orders/{id}/addresses/{addrId}.
+        // The backend order view reads the legacy numbered columns (name1..4,
+        // address1..4), not the named ones (companyName, firstName, ...), so
+        // write the numbered set. Mirrors the working PUT to
+        // /rest/orders/{id}/addresses/{addrId}.
         $update = [
             'name1'         => (string) ($corrected['company']      ?? ''),
             'name2'         => (string) ($corrected['firstName']    ?? ''),

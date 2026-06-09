@@ -6,11 +6,10 @@ use Plenty\Plugin\Log\Loggable;
 use RuntimeException;
 
 /**
- * Direct cURL client for the Heista SaaS V1 API.
+ * cURL client for the Heista V1 API.
  *
- * Note: We deliberately use curl_* + json_* here rather than routing through
- * LibraryCallContract / a resources/lib/ Guzzle connector — past experience
- * with that pattern caused opaque, hard-to-debug failures.
+ * Uses curl and json functions directly instead of LibraryCallContract plus a
+ * Guzzle connector; that route gave us opaque failures that were hard to debug.
  */
 class SaasClient
 {

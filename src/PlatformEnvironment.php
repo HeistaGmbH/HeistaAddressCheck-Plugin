@@ -3,8 +3,7 @@
 namespace HeistaAddressCheck;
 
 /**
- * Resolves a configured environment ("production" | "development") to its
- * Heista platform base URL. The URLs belong to us — customers never enter them.
+ * Maps the configured environment to the Heista API base URL.
  */
 final class PlatformEnvironment
 {
