@@ -96,6 +96,15 @@
             "defaultValue": ""
           }
         },
+        "statusOnEmailRequired": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnEmailRequiredLabel",
+          "options": {
+            "tooltip": "Config.statusOnEmailRequiredTooltip",
+            "defaultValue": ""
+          }
+        },
         "statusOnError": {
           "type": "inputText",
           "required": false,

@@ -364,6 +364,7 @@ class AddressCheckApplyService
             case 'review_suggested':   return 'Prüfung empfohlen';
             case 'undeliverable':      return 'Nicht zustellbar';
             case 'postnumber_invalid': return 'Postnummer ungültig';
+            case 'email_required':     return 'E-Mail-Adresse fehlt';
             case 'error':              return 'Verarbeitungsfehler';
             default:                   return $outputStatus;
         }
@@ -381,6 +382,7 @@ class AddressCheckApplyService
             case 'review_suggested':   return 'Vor Versand kurz prüfen – Straße konnte nicht eindeutig bestätigt werden.';
             case 'undeliverable':      return 'Manuell prüfen oder Kunden kontaktieren – Adresse wurde nicht gefunden.';
             case 'postnumber_invalid': return 'Gültige Postnummer beim Kunden anfordern (Packstation/Postfiliale).';
+            case 'email_required':     return 'E-Mail-Adresse beim Kunden anfordern – für den DPD-Versand erforderlich.';
             case 'error':              return 'Erneut versuchen – die Prüfung ist fehlgeschlagen (kein Ergebnis).';
             default:                   return 'Bitte manuell prüfen.';
         }
@@ -430,6 +432,7 @@ class AddressCheckApplyService
             case 'review_suggested':   $configKey = 'HeistaAddressCheck.statusOnReviewSuggested';   break;
             case 'undeliverable':      $configKey = 'HeistaAddressCheck.statusOnUndeliverable';     break;
             case 'postnumber_invalid': $configKey = 'HeistaAddressCheck.statusOnPostnumberInvalid'; break;
+            case 'email_required':     $configKey = 'HeistaAddressCheck.statusOnEmailRequired';     break;
             case 'error':              $configKey = 'HeistaAddressCheck.statusOnError';             break;
             default:                   return null;
         }

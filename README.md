@@ -39,9 +39,10 @@ Settings live in the plugin configuration of the plugin set.
 **Status mapping**
 
 - `statusOnVerified`, `statusOnCorrected`, `statusOnReviewSuggested`,
-  `statusOnUndeliverable`, `statusOnPostnumberInvalid`, `statusOnError` – order
-  status IDs to set per outcome. Leave empty to keep the current status. See the
-  outcome table below for what each means and the recommended next step.
+  `statusOnUndeliverable`, `statusOnPostnumberInvalid`, `statusOnEmailRequired`,
+  `statusOnError` – order status IDs to set per outcome. Leave empty to keep the
+  current status. See the outcome table below for what each means and the
+  recommended next step.
 - `commentAuthorUserId` – PlentyONE user ID under which the result comment is
   created. Leave empty to skip the comment.
 
@@ -52,7 +53,10 @@ Settings live in the plugin configuration of the plugin set.
 | `review_suggested` | yes | Cleaned, street not confirmed | glance before shipping |
 | `undeliverable` | no | Address not found | contact customer / fix manually |
 | `postnumber_invalid` | no | Packstation/Postfiliale post number invalid | request a valid post number |
+| `email_required` | no | Carrier needs an email and none is present (e.g. DPD) | request an email from the customer |
 | `error` | no | Check failed (no result / timeout) | retry — not the customer's fault |
+
+Email source for the DPD check: the delivery address email (`AddressOption::TYPE_EMAIL`), falling back to the order's billing address email.
 
 **Shipping mapping**
 

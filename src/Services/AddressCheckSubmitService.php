@@ -84,8 +84,12 @@ class AddressCheckSubmitService
             'provider'  => $shippingProvider !== '' ? $shippingProvider : '(none)',
         ]);
 
+        // Customer email for carrier completeness checks (DPD requires one).
+        // Delivery address first, order billing address as fallback.
+        $email = $this->resolveEmail($orderId, $address);
+
         $callbackUrl = $this->buildCallbackUrl();
-        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $n8nEndpointOverride, $shippingProvider);
+        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $n8nEndpointOverride, $shippingProvider, $email);
 
         try {
             $jobId = $this->saasClient->submitJob($apiBaseUrl, $apiKey, $payload);
@@ -130,7 +134,7 @@ class AddressCheckSubmitService
         return '/address-check/callback';
     }
 
-    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $n8nEndpointOverride = '', string $shippingProvider = ''): array
+    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $n8nEndpointOverride = '', string $shippingProvider = '', string $email = ''): array
     {
         $countryIso = '';
         if (!empty($address->countryId)) {
@@ -153,6 +157,7 @@ class AddressCheckSubmitService
             'city'          => (string) ($address->town        ?: ''),
             'country'       => $countryIso,
             'company'       => (string) ($address->companyName ?: ($address->name1    ?: '')),
+            'email'         => $email,
             'firstName'     => (string) ($address->firstName   ?: ($address->name2    ?: '')),
             'lastName'      => (string) ($address->lastName    ?: ($address->name3    ?: '')),
             'nameAddition'  => (string) ($address->name4       ?: ''),
@@ -178,6 +183,28 @@ class AddressCheckSubmitService
         }
 
         return $payload;
+    }
+
+    /**
+     * Resolve the customer email for the delivery. Prefers the delivery
+     * address's own email option ($address->email, backed by
+     * AddressOption::TYPE_EMAIL); falls back to the order's billing address
+     * email when the delivery address has none. Returns '' when neither has
+     * one — the backend then flags DPD orders as email_required.
+     */
+    private function resolveEmail(int $orderId, Address $deliveryAddress): string
+    {
+        $email = trim((string) ($deliveryAddress->email ?? ''));
+        if ($email !== '') {
+            return $email;
+        }
+
+        try {
+            $billing = $this->orderAddressRepo->findAddressByType($orderId, AddressRelationType::BILLING_ADDRESS);
+            return trim((string) ($billing->email ?? ''));
+        } catch (Throwable $e) {
+            return '';
+        }
     }
 
     /**
