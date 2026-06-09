@@ -1,7 +1,6 @@
 {
   "name": "HeistaAddressCheck",
   "namespace": "HeistaAddressCheck",
-  "phpNamespace": "HeistaAddressCheck",
   "type": "integration",
   "version": "1.0.0",
   "description": "Validates and corrects order delivery addresses via the Heista SaaS platform. Submits each tagged order to the platform on creation, applies corrections via webhook (fast path) or cron-poll (fallback).",

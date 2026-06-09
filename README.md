@@ -22,7 +22,6 @@ webhook callback (fast path) or a periodic cron poll (fallback).
 ## Requirements
 
 - PlentyONE
-- PHP 8.0 or newer
 - A Heista account with an API key
 
 ## Configuration
