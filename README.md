@@ -38,11 +38,21 @@ Settings live in the plugin configuration of the plugin set.
 
 **Status mapping**
 
-- `statusOnCorrected`, `statusOnManualReview`, `statusOnInvalid`,
-  `statusOnNotFound` – order status IDs to set per outcome. Leave empty to keep
-  the current status.
-- `commentAuthorUserId` – PlentyONE user ID under which the original-address
-  comment is created. Leave empty to skip the comment.
+- `statusOnVerified`, `statusOnCorrected`, `statusOnReviewSuggested`,
+  `statusOnUndeliverable`, `statusOnPostnumberInvalid`, `statusOnError` – order
+  status IDs to set per outcome. Leave empty to keep the current status. See the
+  outcome table below for what each means and the recommended next step.
+- `commentAuthorUserId` – PlentyONE user ID under which the result comment is
+  created. Leave empty to skip the comment.
+
+| Outcome | Address applied? | Meaning | Next step |
+|---|---|---|---|
+| `verified` | yes (unchanged) | Google-confirmed, nothing changed | none, ship |
+| `corrected` | yes | Fields changed + Google-confirmed | optional spot-check (original kept in comment) |
+| `review_suggested` | yes | Cleaned, street not confirmed | glance before shipping |
+| `undeliverable` | no | Address not found | contact customer / fix manually |
+| `postnumber_invalid` | no | Packstation/Postfiliale post number invalid | request a valid post number |
+| `error` | no | Check failed (no result / timeout) | retry — not the customer's fault |
 
 **Shipping mapping**
 

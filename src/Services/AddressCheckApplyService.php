@@ -95,25 +95,26 @@ class AddressCheckApplyService
             return;
         }
 
-        $outputStatus = (string) ($output['status'] ?? '');
-        $isValid      = !empty($output['isValid']);
-        $corrected    = $output['corrected'] ?? null;
-        $input        = is_array($item) ? ($item['input'] ?? null) : null;
+        $outputStatus  = (string) ($output['status'] ?? '');
+        $isValid       = !empty($output['isValid']);
+        $corrected     = $output['corrected'] ?? null;
+        $input         = is_array($item) ? ($item['input'] ?? null) : null;
+        $changedFields = is_array($output['changedFields'] ?? null) ? $output['changedFields'] : [];
 
         // Resolve the configured target status for this outcome up front,
         // whether or not we apply the address. Empty/non-numeric is skipped.
         $targetStatusId = $this->resolveTargetStatusId($outputStatus);
 
         // Apply the correction whenever the result is valid and a structured
-        // corrected payload came back. Covers both 'corrected' and
-        // 'manual_review' (cleaned but flagged for a human). We still set the
-        // configured status and keep the original address as an internal
+        // corrected payload came back. Covers 'verified', 'corrected' and
+        // 'review_suggested' (cleaned but Google flagged for a human). We still
+        // set the configured status and keep the original address as an internal
         // comment so the merchant can revert a bad correction.
         $shouldApplyAddress = $isValid && is_array($corrected);
 
         if ($shouldApplyAddress) {
             try {
-                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $outputStatus, $jobId, $targetStatusId): void {
+                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $outputStatus, $changedFields, $jobId, $targetStatusId): void {
                     $update = $this->mapCorrectedToPlentyFields($corrected);
                     $this->orderAddressRepo->updateOrderAddress(
                         $update,
@@ -122,50 +123,13 @@ class AddressCheckApplyService
                         AddressRelationType::DELIVERY_ADDRESS
                     );
 
-                    // Comment is supplementary: if it throws, don't roll back
-                    // the address apply. Logged at error level so it shows up
-                    // without enabling debug logging.
-                    $authorUserId = $this->resolveCommentAuthorUserId();
-                    if (!is_array($input)) {
-                        $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentSkippedNoInput', [
-                            'jobId'   => $jobId,
-                            'orderId' => $orderId,
-                        ]);
-                    } elseif ($authorUserId === null) {
-                        $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentSkippedNoUser', [
-                            'jobId'   => $jobId,
-                            'orderId' => $orderId,
-                        ]);
-                    } else {
-                        try {
-                            $commentId = $this->createOriginalAddressComment($orderId, $input, $outputStatus, $jobId, $authorUserId);
-                            $this->report(__METHOD__, 'HeistaAddressCheck::log.commentCreated', [
-                                'jobId'     => $jobId,
-                                'orderId'   => $orderId,
-                                'commentId' => $commentId,
-                                'userId'    => $authorUserId,
-                            ]);
-                        } catch (Throwable $e) {
-                            $validationDetails = '';
-                            if ($e instanceof ValidationException) {
-                                try {
-                                    $bag = $e->getMessageBag();
-                                    $validationDetails = is_object($bag)
-                                        ? (string) json_encode($bag->toArray(), JSON_UNESCAPED_UNICODE)
-                                        : '';
-                                } catch (Throwable $inner) {
-                                    $validationDetails = 'unreadable: ' . $inner->getMessage();
-                                }
-                            }
-                            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentCreateFailed', [
-                                'jobId'             => $jobId,
-                                'orderId'           => $orderId,
-                                'userId'            => $authorUserId,
-                                'error'             => $e->getMessage(),
-                                'class'             => get_class($e),
-                                'validationDetails' => $validationDetails,
-                            ]);
-                        }
+                    // Leave an internal note with the outcome + next step (the
+                    // original address doubles as a revert reference). Skip only
+                    // 'verified' — confirmed as-is, nothing to note. Soft-fail:
+                    // tryPostResultComment never throws, so a comment problem
+                    // can't roll back the address apply.
+                    if ($outputStatus !== 'verified') {
+                        $this->tryPostResultComment($orderId, $input, $outputStatus, $changedFields, true, $jobId);
                     }
 
                     // Status update in the same processUnguarded to avoid
@@ -198,44 +162,104 @@ class AddressCheckApplyService
             return;
         }
 
-        // No usable correction (invalid, or no corrected payload). Leave the
-        // address as-is but still set the configured status so the merchant
-        // can route it to a review queue. Row is marked FAILED to reflect that
-        // the address wasn't applied.
-        if ($targetStatusId !== null) {
-            try {
-                $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId): void {
+        // No usable correction (undeliverable, postnumber_invalid, error). Leave
+        // the address untouched, but post an internal note explaining what Heista
+        // found and the recommended next step, and set the configured status so
+        // the merchant can route it to a review queue. Row is marked FAILED to
+        // reflect that the address wasn't applied.
+        try {
+            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $outputStatus, $changedFields, $jobId): void {
+                $this->tryPostResultComment($orderId, $input, $outputStatus, $changedFields, false, $jobId);
+
+                if ($targetStatusId !== null) {
                     $this->updateOrderStatus($orderId, $targetStatusId);
-                });
-            } catch (Throwable $e) {
-                $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.statusUpdateFailed', [
-                    'jobId'          => $jobId,
-                    'orderId'        => $orderId,
-                    'targetStatusId' => $targetStatusId,
-                    'outputStatus'   => $outputStatus,
-                    'error'          => $e->getMessage(),
-                ]);
-            }
+                }
+            });
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.statusUpdateFailed', [
+                'jobId'          => $jobId,
+                'orderId'        => $orderId,
+                'targetStatusId' => $targetStatusId,
+                'outputStatus'   => $outputStatus,
+                'error'          => $e->getMessage(),
+            ]);
         }
 
         $this->pendingRepo->markFailed($row, 'Address output status: ' . $outputStatus . ' (isValid=' . ($isValid ? '1' : '0') . ')');
     }
 
     /**
-     * Save the original delivery address as an internal order comment (hidden
-     * from the customer) so the merchant can see what was overwritten and
-     * revert a bad correction. Caller wraps this in processUnguarded.
+     * Best-effort internal order comment summarizing the address-check outcome
+     * and the recommended next step. Never throws — a comment is supplementary
+     * and must not roll back an address apply or status update. Caller wraps
+     * this in processUnguarded.
      *
-     * Matches the /rest/comments contract: referenceValue as int, userId a
-     * positive integer (0 or missing both fail validation), text as HTML.
+     * @param bool $applied true when the corrected address was written (the
+     *                      comment then frames the snapshot as "before
+     *                      correction"); false for the not-applied outcomes
+     *                      (address left untouched).
      */
-    private function createOriginalAddressComment(int $orderId, array $input, string $outputStatus, string $jobId, int $authorUserId): int
+    private function tryPostResultComment(int $orderId, $input, string $outputStatus, array $changedFields, bool $applied, string $jobId): void
+    {
+        $authorUserId = $this->resolveCommentAuthorUserId();
+        if ($authorUserId === null) {
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentSkippedNoUser', [
+                'jobId'   => $jobId,
+                'orderId' => $orderId,
+            ]);
+            return;
+        }
+
+        $safeInput = is_array($input) ? $input : [];
+
+        try {
+            $commentId = $this->createComment(
+                $orderId,
+                $this->formatResultComment($safeInput, $outputStatus, $changedFields, $applied, $jobId),
+                $authorUserId
+            );
+            $this->report(__METHOD__, 'HeistaAddressCheck::log.commentCreated', [
+                'jobId'     => $jobId,
+                'orderId'   => $orderId,
+                'commentId' => $commentId,
+                'userId'    => $authorUserId,
+                'applied'   => $applied ? '1' : '0',
+            ]);
+        } catch (Throwable $e) {
+            $validationDetails = '';
+            if ($e instanceof ValidationException) {
+                try {
+                    $bag = $e->getMessageBag();
+                    $validationDetails = is_object($bag)
+                        ? (string) json_encode($bag->toArray(), JSON_UNESCAPED_UNICODE)
+                        : '';
+                } catch (Throwable $inner) {
+                    $validationDetails = 'unreadable: ' . $inner->getMessage();
+                }
+            }
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentCreateFailed', [
+                'jobId'             => $jobId,
+                'orderId'           => $orderId,
+                'userId'            => $authorUserId,
+                'error'             => $e->getMessage(),
+                'class'             => get_class($e),
+                'validationDetails' => $validationDetails,
+            ]);
+        }
+    }
+
+    /**
+     * Create an internal (customer-hidden) order comment with the given HTML
+     * body. Matches the /rest/comments contract: referenceValue as int, userId
+     * a positive integer (0 or missing both fail validation), text as HTML.
+     */
+    private function createComment(int $orderId, string $html, int $authorUserId): int
     {
         $created = $this->commentRepo->createComment([
             'referenceType'       => Comment::REFERENCE_TYPE_ORDER,
             'referenceValue'      => $orderId,
             'userId'              => $authorUserId,
-            'text'                => $this->formatOriginalAddressComment($input, $outputStatus, $jobId),
+            'text'                => $html,
             'isVisibleForContact' => false,
         ]);
 
@@ -262,8 +286,12 @@ class AddressCheckApplyService
      * them that way, so we emit HTML. Empty fields are skipped. Labels are
      * German on purpose (comments aren't translated and the audience is German
      * merchants). Values are escaped in case a customer entered angle brackets.
+     *
+     * Leads with the outcome + a one-line next step so the operator knows what
+     * to do at a glance, then the changed fields (when applied), then the
+     * submitted address snapshot (revert reference / what we received).
      */
-    private function formatOriginalAddressComment(array $input, string $outputStatus, string $jobId): string
+    private function formatResultComment(array $input, string $outputStatus, array $changedFields, bool $applied, string $jobId): string
     {
         // postnumber is intentionally not in this list: Plenty keeps a post
         // number on every address, but it only matters for Packstation/
@@ -306,12 +334,86 @@ class AddressCheckApplyService
             }
         }
 
-        $body  = '<p><strong>Heista Adressprüfung – Originaladresse vor Korrektur</strong><br>';
-        $body .= 'Status: ' . htmlspecialchars($outputStatus, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
-        $body .= '<p>' . implode('<br>', $rows) . '</p>';
+        $snapshotLabel = $applied ? 'Originaladresse vor Korrektur' : 'Eingegangene Adresse (unverändert)';
+
+        $body  = '<p><strong>Heista Adressprüfung</strong><br>';
+        $body .= 'Ergebnis: ' . htmlspecialchars($this->statusLabel($outputStatus), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
+        $body .= 'Nächster Schritt: ' . htmlspecialchars($this->nextStepText($outputStatus), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+
+        if ($applied && !empty($changedFields)) {
+            $body .= '<p><strong>Geänderte Felder:</strong> '
+                   . htmlspecialchars($this->changedFieldsLabel($changedFields), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+        }
+
+        $body .= '<p><strong>' . htmlspecialchars($snapshotLabel, ENT_QUOTES | ENT_HTML5, 'UTF-8') . ':</strong><br>';
+        $body .= implode('<br>', $rows) . '</p>';
         $body .= '<p><em>Job-ID: ' . htmlspecialchars($jobId, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</em></p>';
 
         return $body;
+    }
+
+    /**
+     * Human-readable German label for an outcome status, shown in the order
+     * comment. Falls back to the raw key for unknown values.
+     */
+    private function statusLabel(string $outputStatus): string
+    {
+        switch ($outputStatus) {
+            case 'verified':           return 'Bestätigt (keine Änderung)';
+            case 'corrected':          return 'Korrigiert';
+            case 'review_suggested':   return 'Prüfung empfohlen';
+            case 'undeliverable':      return 'Nicht zustellbar';
+            case 'postnumber_invalid': return 'Postnummer ungültig';
+            case 'error':              return 'Verarbeitungsfehler';
+            default:                   return $outputStatus;
+        }
+    }
+
+    /**
+     * One-line German next-step hint per outcome, so the operator knows what to
+     * do without interpreting the status themselves.
+     */
+    private function nextStepText(string $outputStatus): string
+    {
+        switch ($outputStatus) {
+            case 'verified':           return 'Keine Aktion nötig – Adresse von Google Maps bestätigt.';
+            case 'corrected':          return 'Optional prüfen – Felder wurden korrigiert (Original siehe unten).';
+            case 'review_suggested':   return 'Vor Versand kurz prüfen – Straße konnte nicht eindeutig bestätigt werden.';
+            case 'undeliverable':      return 'Manuell prüfen oder Kunden kontaktieren – Adresse wurde nicht gefunden.';
+            case 'postnumber_invalid': return 'Gültige Postnummer beim Kunden anfordern (Packstation/Postfiliale).';
+            case 'error':              return 'Erneut versuchen – die Prüfung ist fehlgeschlagen (kein Ergebnis).';
+            default:                   return 'Bitte manuell prüfen.';
+        }
+    }
+
+    /**
+     * Map the machine field keys Heista returns in changedFields to the German
+     * labels used elsewhere in the comment; join for display.
+     */
+    private function changedFieldsLabel(array $changedFields): string
+    {
+        $map = [
+            'company'      => 'Firma',
+            'firstName'    => 'Vorname',
+            'lastName'     => 'Nachname',
+            'nameAddition' => 'Namenszusatz',
+            'street'       => 'Straße',
+            'houseNumber'  => 'Hausnummer',
+            'addressLine1' => 'Adresszusatz 1',
+            'addressLine2' => 'Adresszusatz 2',
+            'postalCode'   => 'PLZ',
+            'city'         => 'Ort',
+            'country'      => 'Land',
+            'postnumber'   => 'Postnummer',
+        ];
+
+        $out = [];
+        foreach ($changedFields as $field) {
+            $key   = (string) $field;
+            $out[] = $map[$key] ?? $key;
+        }
+
+        return implode(', ', $out);
     }
 
     /**
@@ -323,11 +425,13 @@ class AddressCheckApplyService
     {
         $configKey = '';
         switch ($outputStatus) {
-            case 'corrected':     $configKey = 'HeistaAddressCheck.statusOnCorrected';    break;
-            case 'manual_review': $configKey = 'HeistaAddressCheck.statusOnManualReview'; break;
-            case 'invalid':       $configKey = 'HeistaAddressCheck.statusOnInvalid';      break;
-            case 'not_found':     $configKey = 'HeistaAddressCheck.statusOnNotFound';     break;
-            default:              return null;
+            case 'verified':           $configKey = 'HeistaAddressCheck.statusOnVerified';          break;
+            case 'corrected':          $configKey = 'HeistaAddressCheck.statusOnCorrected';         break;
+            case 'review_suggested':   $configKey = 'HeistaAddressCheck.statusOnReviewSuggested';   break;
+            case 'undeliverable':      $configKey = 'HeistaAddressCheck.statusOnUndeliverable';     break;
+            case 'postnumber_invalid': $configKey = 'HeistaAddressCheck.statusOnPostnumberInvalid'; break;
+            case 'error':              $configKey = 'HeistaAddressCheck.statusOnError';             break;
+            default:                   return null;
         }
 
         $raw = trim((string) $this->config->get($configKey));

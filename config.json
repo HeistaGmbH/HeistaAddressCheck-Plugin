@@ -51,6 +51,15 @@
     "statusMapping": {
       "label": "Config.sectionStatusMapping",
       "formFields": {
+        "statusOnVerified": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnVerifiedLabel",
+          "options": {
+            "tooltip": "Config.statusOnVerifiedTooltip",
+            "defaultValue": ""
+          }
+        },
         "statusOnCorrected": {
           "type": "inputText",
           "required": false,
@@ -60,30 +69,39 @@
             "defaultValue": ""
           }
         },
-        "statusOnManualReview": {
+        "statusOnReviewSuggested": {
           "type": "inputText",
           "required": false,
-          "label": "Config.statusOnManualReviewLabel",
+          "label": "Config.statusOnReviewSuggestedLabel",
           "options": {
-            "tooltip": "Config.statusOnManualReviewTooltip",
+            "tooltip": "Config.statusOnReviewSuggestedTooltip",
             "defaultValue": ""
           }
         },
-        "statusOnInvalid": {
+        "statusOnUndeliverable": {
           "type": "inputText",
           "required": false,
-          "label": "Config.statusOnInvalidLabel",
+          "label": "Config.statusOnUndeliverableLabel",
           "options": {
-            "tooltip": "Config.statusOnInvalidTooltip",
+            "tooltip": "Config.statusOnUndeliverableTooltip",
             "defaultValue": ""
           }
         },
-        "statusOnNotFound": {
+        "statusOnPostnumberInvalid": {
           "type": "inputText",
           "required": false,
-          "label": "Config.statusOnNotFoundLabel",
+          "label": "Config.statusOnPostnumberInvalidLabel",
           "options": {
-            "tooltip": "Config.statusOnNotFoundTooltip",
+            "tooltip": "Config.statusOnPostnumberInvalidTooltip",
+            "defaultValue": ""
+          }
+        },
+        "statusOnError": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnErrorLabel",
+          "options": {
+            "tooltip": "Config.statusOnErrorTooltip",
             "defaultValue": ""
           }
         },
