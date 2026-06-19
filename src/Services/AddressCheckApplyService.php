@@ -96,6 +96,7 @@ class AddressCheckApplyService
         }
 
         $outputStatus  = (string) ($output['status'] ?? '');
+        $outputReason  = (string) ($output['reason'] ?? '');
         $isValid       = !empty($output['isValid']);
         $corrected     = $output['corrected'] ?? null;
         $input         = is_array($item) ? ($item['input'] ?? null) : null;
@@ -114,7 +115,7 @@ class AddressCheckApplyService
 
         if ($shouldApplyAddress) {
             try {
-                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $outputStatus, $changedFields, $jobId, $targetStatusId): void {
+                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $outputStatus, $outputReason, $changedFields, $jobId, $targetStatusId): void {
                     $update = $this->mapCorrectedToPlentyFields($corrected);
                     $this->orderAddressRepo->updateOrderAddress(
                         $update,
@@ -129,7 +130,7 @@ class AddressCheckApplyService
                     // tryPostResultComment never throws, so a comment problem
                     // can't roll back the address apply.
                     if ($outputStatus !== 'verified') {
-                        $this->tryPostResultComment($orderId, $input, $outputStatus, $changedFields, true, $jobId);
+                        $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, true, $jobId);
                     }
 
                     // Status update in the same processUnguarded to avoid
@@ -168,8 +169,8 @@ class AddressCheckApplyService
         // the merchant can route it to a review queue. Row is marked FAILED to
         // reflect that the address wasn't applied.
         try {
-            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $outputStatus, $changedFields, $jobId): void {
-                $this->tryPostResultComment($orderId, $input, $outputStatus, $changedFields, false, $jobId);
+            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $outputStatus, $outputReason, $changedFields, $jobId): void {
+                $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, false, $jobId);
 
                 if ($targetStatusId !== null) {
                     $this->updateOrderStatus($orderId, $targetStatusId);
@@ -199,7 +200,7 @@ class AddressCheckApplyService
      *                      correction"); false for the not-applied outcomes
      *                      (address left untouched).
      */
-    private function tryPostResultComment(int $orderId, $input, string $outputStatus, array $changedFields, bool $applied, string $jobId): void
+    private function tryPostResultComment(int $orderId, $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId): void
     {
         $authorUserId = $this->resolveCommentAuthorUserId();
         if ($authorUserId === null) {
@@ -215,7 +216,7 @@ class AddressCheckApplyService
         try {
             $commentId = $this->createComment(
                 $orderId,
-                $this->formatResultComment($safeInput, $outputStatus, $changedFields, $applied, $jobId),
+                $this->formatResultComment($safeInput, $outputStatus, $outputReason, $changedFields, $applied, $jobId),
                 $authorUserId
             );
             $this->report(__METHOD__, 'HeistaAddressCheck::log.commentCreated', [
@@ -291,7 +292,7 @@ class AddressCheckApplyService
      * to do at a glance, then the changed fields (when applied), then the
      * submitted address snapshot (revert reference / what we received).
      */
-    private function formatResultComment(array $input, string $outputStatus, array $changedFields, bool $applied, string $jobId): string
+    private function formatResultComment(array $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId): string
     {
         // postnumber is intentionally not in this list: Plenty keeps a post
         // number on every address, but it only matters for Packstation/
@@ -337,8 +338,8 @@ class AddressCheckApplyService
         $snapshotLabel = $applied ? 'Originaladresse vor Korrektur' : 'Eingegangene Adresse (unverändert)';
 
         $body  = '<p><strong>Heista Adressprüfung</strong><br>';
-        $body .= 'Ergebnis: ' . htmlspecialchars($this->statusLabel($outputStatus), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
-        $body .= 'Nächster Schritt: ' . htmlspecialchars($this->nextStepText($outputStatus), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+        $body .= 'Ergebnis: ' . htmlspecialchars($this->statusLabel($outputStatus, $outputReason), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
+        $body .= 'Nächster Schritt: ' . htmlspecialchars($this->nextStepText($outputStatus, $outputReason), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
 
         if ($applied && !empty($changedFields)) {
             $body .= '<p><strong>Geänderte Felder:</strong> '
@@ -354,10 +355,16 @@ class AddressCheckApplyService
 
     /**
      * Human-readable German label for an outcome status, shown in the order
-     * comment. Falls back to the raw key for unknown values.
+     * comment. A reason code can refine the label where a status bucket covers
+     * several distinct causes (e.g. undeliverable = not-found vs no house
+     * number). Falls back to the raw key for unknown values.
      */
-    private function statusLabel(string $outputStatus): string
+    private function statusLabel(string $outputStatus, string $outputReason = ''): string
     {
+        if ($outputReason === 'house_number_missing') {
+            return 'Nicht zustellbar (Hausnummer fehlt)';
+        }
+
         switch ($outputStatus) {
             case 'verified':           return 'Bestätigt (keine Änderung)';
             case 'corrected':          return 'Korrigiert';
@@ -372,10 +379,15 @@ class AddressCheckApplyService
 
     /**
      * One-line German next-step hint per outcome, so the operator knows what to
-     * do without interpreting the status themselves.
+     * do without interpreting the status themselves. A reason code can override
+     * the status-level hint where the same status covers several causes.
      */
-    private function nextStepText(string $outputStatus): string
+    private function nextStepText(string $outputStatus, string $outputReason = ''): string
     {
+        if ($outputReason === 'house_number_missing') {
+            return 'Hausnummer fehlt – beim Kunden anfordern und ergänzen.';
+        }
+
         switch ($outputStatus) {
             case 'verified':           return 'Keine Aktion nötig – Adresse von Google Maps bestätigt.';
             case 'corrected':          return 'Optional prüfen – Felder wurden korrigiert (Original siehe unten).';
