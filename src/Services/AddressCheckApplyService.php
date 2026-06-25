@@ -389,7 +389,7 @@ class AddressCheckApplyService
         }
 
         switch ($outputStatus) {
-            case 'verified':           return 'Keine Aktion nötig – Adresse von Google Maps bestätigt.';
+            case 'verified':           return 'Keine Aktion nötig – Adresse bestätigt.';
             case 'corrected':          return 'Optional prüfen – Felder wurden korrigiert (Original siehe unten).';
             case 'review_suggested':   return 'Vor Versand kurz prüfen – Straße konnte nicht eindeutig bestätigt werden.';
             case 'undeliverable':      return 'Manuell prüfen oder Kunden kontaktieren – Adresse wurde nicht gefunden.';
