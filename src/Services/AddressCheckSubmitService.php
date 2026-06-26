@@ -46,14 +46,19 @@ class AddressCheckSubmitService
     {
         $orderId = (int) $order->id;
 
-        $environment    = (string) $this->config->get('HeistaAddressCheck.environment', PlatformEnvironment::PRODUCTION);
-        $apiKey         = trim((string) $this->config->get('HeistaAddressCheck.apiKey'));
-        $callbackSecret = trim((string) $this->config->get('HeistaAddressCheck.callbackSecret'));
+        $environment = (string) $this->config->get('HeistaAddressCheck.environment', PlatformEnvironment::PRODUCTION);
+        $apiKey      = trim((string) $this->config->get('HeistaAddressCheck.apiKey'));
 
-        if ($apiKey === '' || $callbackSecret === '') {
+        if ($apiKey === '') {
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.missingConfig', ['orderId' => $orderId]);
             return;
         }
+
+        // Per-job callback token, derived from the API key the merchant already
+        // configured — there is no separate callback secret to paste anymore.
+        // The platform echoes this verbatim in the X-Heista-Secret header on the
+        // result webhook; CallbackController re-derives and verifies it.
+        $callbackSecret = CallbackToken::issue($apiKey);
 
         $devOverride = trim((string) $this->config->get('HeistaAddressCheck.devApiBaseUrlOverride'));
         $apiBaseUrl  = PlatformEnvironment::baseUrlFor($environment, $devOverride);
