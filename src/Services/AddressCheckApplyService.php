@@ -364,6 +364,12 @@ class AddressCheckApplyService
         if ($outputReason === 'house_number_missing') {
             return 'Nicht zustellbar (Hausnummer fehlt)';
         }
+        if ($outputReason === 'street_not_confirmed') {
+            return 'Nicht zustellbar (Straße nicht bestätigt)';
+        }
+        if ($outputReason === 'town_corrected_review') {
+            return 'Prüfung empfohlen (Ort geändert)';
+        }
 
         switch ($outputStatus) {
             case 'verified':           return 'Bestätigt (keine Änderung)';
@@ -386,6 +392,12 @@ class AddressCheckApplyService
     {
         if ($outputReason === 'house_number_missing') {
             return 'Hausnummer fehlt – beim Kunden anfordern und ergänzen.';
+        }
+        if ($outputReason === 'street_not_confirmed') {
+            return 'Straße konnte nicht bestätigt werden – beim Kunden prüfen (PLZ/Ort stimmen, Straße evtl. falsch).';
+        }
+        if ($outputReason === 'town_corrected_review') {
+            return 'Ort wurde automatisch geändert – bitte prüfen, ob der neue Ort stimmt (Original siehe unten, ggf. zurücksetzen).';
         }
 
         switch ($outputStatus) {
