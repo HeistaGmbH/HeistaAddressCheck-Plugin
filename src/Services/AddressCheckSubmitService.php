@@ -11,6 +11,7 @@ use Plenty\Modules\Order\Address\Contracts\OrderAddressRepositoryContract;
 use Plenty\Modules\Order\Models\Order;
 use Plenty\Modules\Order\Property\Models\OrderPropertyType;
 use Plenty\Modules\Order\Shipping\Countries\Contracts\CountryRepositoryContract;
+use Plenty\Plugin\Application;
 use Plenty\Plugin\ConfigRepository;
 use Plenty\Plugin\Log\Loggable;
 use Plenty\Plugin\Log\Reportable;
@@ -89,6 +90,11 @@ class AddressCheckSubmitService
         $email = $this->resolveEmail($orderId, $address);
 
         $callbackUrl = $this->buildCallbackUrl();
+        $this->getLogger(__METHOD__)->debug('HeistaAddressCheck::log.callbackUrlResolved', [
+            'orderId'     => $orderId,
+            'plentyId'    => (int) pluginApp(Application::class)->getPlentyId(),
+            'callbackUrl' => $callbackUrl,
+        ]);
         $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $n8nEndpointOverride, $shippingProvider, $email);
 
         try {
@@ -125,13 +131,22 @@ class AddressCheckSubmitService
 
     private function buildCallbackUrl(): string
     {
-        $configured = trim((string) $this->config->get('HeistaAddressCheck.pluginCallbackBaseUrl'));
-        if ($configured !== '') {
-            return rtrim($configured, '/') . '/address-check/callback';
+        // The callback is a PUBLIC REST route served by the PlentyONE REST layer
+        // at /rest/heista/address-check/callback (see AddressCheckRouteServiceProvider).
+        // The URL is auto-derived from this system's plentyId — the merchant never
+        // configures it. The *.my.plentysystems.com system host always serves
+        // /rest/ regardless of storefront, so this works even on headless PWA
+        // shops. plentyId == the `p<N>` number in the system URL
+        // (verified: plentyId 15950 -> p15950.my.plentysystems.com).
+        $plentyId = (int) pluginApp(Application::class)->getPlentyId();
+        if ($plentyId <= 0) {
+            // No plenty context -> can't build an absolute host. Return empty so
+            // the SaaS skips the push callback and falls back to its cron-poll.
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.callbackPlentyIdMissing', []);
+            return '';
         }
-        // Relative fallback. The API requires https, so pluginCallbackBaseUrl
-        // has to be set for the webhook callback to actually work.
-        return '/address-check/callback';
+
+        return 'https://p' . $plentyId . '.my.plentysystems.com/rest/heista/address-check/callback';
     }
 
     private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $n8nEndpointOverride = '', string $shippingProvider = '', string $email = ''): array

@@ -6,7 +6,8 @@
       "formFields": {
         "environment": {
           "type": "selectBox",
-          "required": true,
+          "required": false,
+          "deprecated": true,
           "label": "Config.environmentLabel",
           "options": {
             "tooltip": "Config.environmentTooltip",
@@ -37,12 +38,23 @@
             "defaultValue": ""
           }
         },
-        "pluginCallbackBaseUrl": {
+        "devApiBaseUrlOverride": {
           "type": "inputText",
           "required": false,
-          "label": "Config.pluginCallbackBaseUrlLabel",
+          "deprecated": true,
+          "label": "Config.devApiBaseUrlOverrideLabel",
           "options": {
-            "tooltip": "Config.pluginCallbackBaseUrlTooltip",
+            "tooltip": "Config.devApiBaseUrlOverrideTooltip",
+            "defaultValue": ""
+          }
+        },
+        "devN8nEndpointOverride": {
+          "type": "inputText",
+          "required": false,
+          "deprecated": true,
+          "label": "Config.devN8nEndpointOverrideLabel",
+          "options": {
+            "tooltip": "Config.devN8nEndpointOverrideTooltip",
             "defaultValue": ""
           }
         }
@@ -143,32 +155,6 @@
           "label": "Config.dpdProfileIdsLabel",
           "options": {
             "tooltip": "Config.dpdProfileIdsTooltip",
-            "defaultValue": ""
-          }
-        }
-      }
-    },
-    "dev": {
-      "label": "Config.sectionDev",
-      "deprecated": true,
-      "formFields": {
-        "devApiBaseUrlOverride": {
-          "type": "inputText",
-          "required": false,
-          "deprecated": true,
-          "label": "Config.devApiBaseUrlOverrideLabel",
-          "options": {
-            "tooltip": "Config.devApiBaseUrlOverrideTooltip",
-            "defaultValue": ""
-          }
-        },
-        "devN8nEndpointOverride": {
-          "type": "inputText",
-          "required": false,
-          "deprecated": true,
-          "label": "Config.devN8nEndpointOverrideLabel",
-          "options": {
-            "tooltip": "Config.devN8nEndpointOverrideTooltip",
             "defaultValue": ""
           }
         }

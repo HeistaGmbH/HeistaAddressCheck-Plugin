@@ -33,8 +33,11 @@ Settings live in the plugin configuration of the plugin set.
 - `environment` – production or development.
 - `apiKey` – your Heista API key.
 - `callbackSecret` – shared secret used to authenticate the inbound webhook.
-- `pluginCallbackBaseUrl` – public HTTPS base URL of the shop, required for the
-  webhook fast path.
+
+The webhook callback URL is **auto-derived** from the PlentyONE system URL
+(`https://p{plentyId}.my.plentysystems.com/rest/heista/address-check/callback`)
+and needs no configuration. If the platform can't push (e.g. the system URL is
+unreachable), the cron-poll fallback still applies corrections.
 
 **Status mapping**
 
