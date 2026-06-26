@@ -36,15 +36,6 @@
             "isPassword": true,
             "defaultValue": ""
           }
-        },
-        "pluginCallbackBaseUrl": {
-          "type": "inputText",
-          "required": false,
-          "label": "Config.pluginCallbackBaseUrlLabel",
-          "options": {
-            "tooltip": "Config.pluginCallbackBaseUrlTooltip",
-            "defaultValue": ""
-          }
         }
       }
     },
