@@ -3,6 +3,7 @@
 namespace HeistaAddressCheck\Controllers;
 
 use HeistaAddressCheck\Services\AddressCheckApplyService;
+use HeistaAddressCheck\Services\CallbackToken;
 use Plenty\Plugin\ConfigRepository;
 use Plenty\Plugin\Controller;
 use Plenty\Plugin\Http\Request;
@@ -42,13 +43,16 @@ class CallbackController extends Controller
             'secretSource' => $secretSource,
         ]);
 
-        $expectedSecret = trim((string) $config->get('HeistaAddressCheck.callbackSecret'));
-        if ($expectedSecret === '') {
+        // The callback token is derived from the merchant's API key at submit
+        // time (CallbackToken::issue) and echoed back verbatim in the header.
+        // Re-derive and verify it here — there is no separate callback secret.
+        $apiKey = trim((string) $config->get('HeistaAddressCheck.apiKey'));
+        if ($apiKey === '') {
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.callbackNoSecret');
             return $response->json(['error' => 'callback secret not configured'], 401);
         }
 
-        if ($providedSecret !== $expectedSecret) {
+        if (!CallbackToken::verify($providedSecret, $apiKey)) {
             $this->getLogger(__METHOD__)->debug('HeistaAddressCheck::log.callbackUnauthorized', [
                 'remoteIp'     => $remoteIp,
                 'secretSource' => $secretSource,

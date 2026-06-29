@@ -7,7 +7,9 @@ use HeistaAddressCheck\PlatformEnvironment;
 use HeistaAddressCheck\Repositories\PendingAddressCheckRepository;
 use Plenty\Modules\Account\Address\Models\Address;
 use Plenty\Modules\Account\Address\Models\AddressRelationType;
+use Plenty\Modules\Authorization\Services\AuthHelper;
 use Plenty\Modules\Order\Address\Contracts\OrderAddressRepositoryContract;
+use Plenty\Modules\Order\Contracts\OrderRepositoryContract;
 use Plenty\Modules\Order\Models\Order;
 use Plenty\Modules\Order\Property\Models\OrderPropertyType;
 use Plenty\Modules\Order\Shipping\Countries\Contracts\CountryRepositoryContract;
@@ -24,21 +26,27 @@ class AddressCheckSubmitService
 
     private SaasClient $saasClient;
     private OrderAddressRepositoryContract $orderAddressRepo;
+    private OrderRepositoryContract $orderRepo;
     private CountryRepositoryContract $countryRepo;
     private PendingAddressCheckRepository $pendingRepo;
+    private AuthHelper $authHelper;
     private ConfigRepository $config;
 
     public function __construct(
         SaasClient $saasClient,
         OrderAddressRepositoryContract $orderAddressRepo,
+        OrderRepositoryContract $orderRepo,
         CountryRepositoryContract $countryRepo,
         PendingAddressCheckRepository $pendingRepo,
+        AuthHelper $authHelper,
         ConfigRepository $config
     ) {
         $this->saasClient       = $saasClient;
         $this->orderAddressRepo = $orderAddressRepo;
+        $this->orderRepo        = $orderRepo;
         $this->countryRepo      = $countryRepo;
         $this->pendingRepo      = $pendingRepo;
+        $this->authHelper       = $authHelper;
         $this->config           = $config;
     }
 
@@ -46,14 +54,19 @@ class AddressCheckSubmitService
     {
         $orderId = (int) $order->id;
 
-        $environment    = (string) $this->config->get('HeistaAddressCheck.environment', PlatformEnvironment::PRODUCTION);
-        $apiKey         = trim((string) $this->config->get('HeistaAddressCheck.apiKey'));
-        $callbackSecret = trim((string) $this->config->get('HeistaAddressCheck.callbackSecret'));
+        $environment = (string) $this->config->get('HeistaAddressCheck.environment', PlatformEnvironment::PRODUCTION);
+        $apiKey      = trim((string) $this->config->get('HeistaAddressCheck.apiKey'));
 
-        if ($apiKey === '' || $callbackSecret === '') {
+        if ($apiKey === '') {
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.missingConfig', ['orderId' => $orderId]);
             return;
         }
+
+        // Per-job callback token, derived from the API key the merchant already
+        // configured — there is no separate callback secret to paste anymore.
+        // The platform echoes this verbatim in the X-Heista-Secret header on the
+        // result webhook; CallbackController re-derives and verifies it.
+        $callbackSecret = CallbackToken::issue($apiKey);
 
         $devOverride = trim((string) $this->config->get('HeistaAddressCheck.devApiBaseUrlOverride'));
         $apiBaseUrl  = PlatformEnvironment::baseUrlFor($environment, $devOverride);
@@ -112,6 +125,10 @@ class AddressCheckSubmitService
                 'submittedAt'       => date('Y-m-d H:i:s'),
                 'lastError'         => substr($e->getMessage(), 0, 1000),
             ]);
+            // The check never reached the SaaS (bad/revoked key, network, 5xx).
+            // Route the order to the configured "processing error" status so the
+            // merchant sees it didn't run, instead of it silently staying put.
+            $this->applyErrorStatus($orderId);
             return;
         }
 
@@ -295,5 +312,58 @@ class AddressCheckSubmitService
             }
         }
         return $ids;
+    }
+
+    /**
+     * Route the order to the configured "processing error" status
+     * (Config.statusOnError, "Status bei Verarbeitungsfehler") after a submit
+     * failure. Soft-fail and best-effort: a status problem must never bubble
+     * out of the order-creation event procedure. Empty/non-numeric config means
+     * "leave the order alone" rather than failing.
+     *
+     * Mirrors the status-id parsing + processUnguarded write in
+     * AddressCheckApplyService::resolveTargetStatusId / updateOrderStatus — the
+     * submit path is intentionally decoupled from the apply path; keep the two
+     * in sync if the parsing rules change. Only the 'error' bucket applies here
+     * (the SaaS never ran), so there's no outputStatus switch.
+     */
+    private function applyErrorStatus(int $orderId): void
+    {
+        $configKey = 'HeistaAddressCheck.statusOnError';
+        $raw       = trim((string) $this->config->get($configKey));
+        if ($raw === '') {
+            return;
+        }
+
+        // Plenty status IDs are decimals like "5.1", "7", "8.4". Reject anything
+        // else with a warning so a typo'd config can't corrupt order routing.
+        if (!is_numeric($raw)) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.statusIdInvalid', [
+                'configKey' => $configKey,
+                'value'     => $raw,
+            ]);
+            return;
+        }
+
+        $statusId = (float) $raw;
+        if ($statusId <= 0) {
+            return;
+        }
+
+        try {
+            $this->authHelper->processUnguarded(function () use ($orderId, $statusId): void {
+                $this->orderRepo->updateOrder(['statusId' => $statusId], $orderId);
+            });
+            $this->report(__METHOD__, 'HeistaAddressCheck::log.errorStatusApplied', [
+                'orderId'  => $orderId,
+                'statusId' => $statusId,
+            ]);
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.errorStatusUpdateFailed', [
+                'orderId'        => $orderId,
+                'targetStatusId' => $statusId,
+                'error'          => $e->getMessage(),
+            ]);
+        }
     }
 }

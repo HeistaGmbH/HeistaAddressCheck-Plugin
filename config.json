@@ -28,16 +28,6 @@
             "defaultValue": ""
           }
         },
-        "callbackSecret": {
-          "type": "inputText",
-          "required": true,
-          "label": "Config.callbackSecretLabel",
-          "options": {
-            "tooltip": "Config.callbackSecretTooltip",
-            "isPassword": true,
-            "defaultValue": ""
-          }
-        },
         "devApiBaseUrlOverride": {
           "type": "inputText",
           "required": false,

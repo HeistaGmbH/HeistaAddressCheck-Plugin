@@ -12,7 +12,8 @@ webhook callback (fast path) or a periodic cron poll (fallback).
    checked (for example via an order-status or tag condition).
 2. Heista processes the address and reports the result back two ways:
    - **Webhook (fast path):** a callback to `POST /address-check/callback`,
-     authenticated with a shared secret.
+     authenticated with a per-job token the plugin derives from the API key
+     (the merchant configures no separate secret).
    - **Cron (fallback):** a job that runs every five minutes and polls for any
      results the webhook did not deliver.
 3. When a correction comes back, the plugin updates the delivery address, sets
@@ -31,8 +32,8 @@ Settings live in the plugin configuration of the plugin set.
 **Connection**
 
 - `environment` – production or development.
-- `apiKey` – your Heista API key.
-- `callbackSecret` – shared secret used to authenticate the inbound webhook.
+- `apiKey` – your Heista API key. Also used to derive the per-job token that
+  authenticates the inbound webhook — there is no separate callback secret.
 
 The webhook callback URL is **auto-derived** from the PlentyONE system URL
 (`https://p{plentyId}.my.plentysystems.com/rest/heista/address-check/callback`)
