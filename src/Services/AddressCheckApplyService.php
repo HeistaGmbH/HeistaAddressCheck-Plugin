@@ -77,20 +77,25 @@ class AddressCheckApplyService
         $item      = $body['items'][0] ?? null;
         $orderId   = (int) $row->orderId;
 
-        // Job-level failure: leave the order status alone (a backend bug
-        // shouldn't reroute the merchant's order) and just mark the row failed.
+        // Job-level failure: the check never produced a verdict. The ADDRESS stays
+        // untouched (a backend bug must not rewrite a customer's address), but the order
+        // must not sit in the queue looking checked when it never was — note what happened
+        // and route it to the error status, the same treatment a submit failure gets.
         if ($jobStatus !== 'COMPLETED') {
             $itemError = is_array($item) ? (string) ($item['error'] ?? '') : '';
             $reason    = 'Job ended with status ' . $jobStatus;
             if ($itemError !== '') {
                 $reason .= ' (' . $itemError . ')';
             }
+
+            $this->writeFailureToOrder($orderId, $jobId, is_array($item) ? ($item['input'] ?? null) : null, $reason);
             $this->pendingRepo->markFailed($row, $reason);
             return;
         }
 
         $output = is_array($item) ? ($item['output'] ?? null) : null;
         if (!is_array($output)) {
+            $this->writeFailureToOrder($orderId, $jobId, is_array($item) ? ($item['input'] ?? null) : null, 'Missing output payload');
             $this->pendingRepo->markFailed($row, 'Missing output payload');
             return;
         }
@@ -101,6 +106,11 @@ class AddressCheckApplyService
         $corrected     = $output['corrected'] ?? null;
         $input         = is_array($item) ? ($item['input'] ?? null) : null;
         $changedFields = is_array($output['changedFields'] ?? null) ? $output['changedFields'] : [];
+
+        // DHL's own validation messages. Empty unless a DHL mode ran — and in dhl_only
+        // they are the ONLY explanation for a rejection (no Google check runs on that
+        // path), so the comment must surface them.
+        $dhlMessages = is_array($output['dhlMessages'] ?? null) ? $output['dhlMessages'] : [];
 
         // Resolve the configured target status for this outcome up front,
         // whether or not we apply the address. Empty/non-numeric is skipped.
@@ -115,7 +125,7 @@ class AddressCheckApplyService
 
         if ($shouldApplyAddress) {
             try {
-                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $outputStatus, $outputReason, $changedFields, $jobId, $targetStatusId): void {
+                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $outputStatus, $outputReason, $changedFields, $dhlMessages, $jobId, $targetStatusId): void {
                     $update = $this->mapCorrectedToPlentyFields($corrected);
                     $this->orderAddressRepo->updateOrderAddress(
                         $update,
@@ -124,14 +134,13 @@ class AddressCheckApplyService
                         AddressRelationType::DELIVERY_ADDRESS
                     );
 
-                    // Leave an internal note with the outcome + next step (the
-                    // original address doubles as a revert reference). Skip only
-                    // 'verified' — confirmed as-is, nothing to note. Soft-fail:
-                    // tryPostResultComment never throws, so a comment problem
+                    // Always leave an internal note with the outcome + next step (the
+                    // original address doubles as a revert reference) — 'verified'
+                    // included: every order must show that the check ran and what it
+                    // found, and on a DHL mode the note carries DHL's own messages.
+                    // Soft-fail: tryPostResultComment never throws, so a comment problem
                     // can't roll back the address apply.
-                    if ($outputStatus !== 'verified') {
-                        $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, true, $jobId);
-                    }
+                    $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, true, $jobId, $dhlMessages);
 
                     // Status update in the same processUnguarded to avoid
                     // re-auth. Address is already saved, so a bad statusId
@@ -169,8 +178,8 @@ class AddressCheckApplyService
         // the merchant can route it to a review queue. Row is marked FAILED to
         // reflect that the address wasn't applied.
         try {
-            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $outputStatus, $outputReason, $changedFields, $jobId): void {
-                $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, false, $jobId);
+            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $outputStatus, $outputReason, $changedFields, $dhlMessages, $jobId): void {
+                $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, false, $jobId, $dhlMessages);
 
                 if ($targetStatusId !== null) {
                     $this->updateOrderStatus($orderId, $targetStatusId);
@@ -190,17 +199,51 @@ class AddressCheckApplyService
     }
 
     /**
+     * A job that never produced a verdict (job status != COMPLETED, or an item with no
+     * output payload). The address is left untouched — a backend failure must never
+     * rewrite a customer's address — but the order still gets an internal note and the
+     * configured error status, so it can't pass through the queue looking checked when
+     * it never was. Mirrors what AddressCheckSubmitService does when the submit itself
+     * fails; `statusOnError` therefore covers both "never submitted" and "submitted but
+     * no verdict". Soft-fail: never throws into the caller.
+     */
+    private function writeFailureToOrder(int $orderId, string $jobId, $input, string $failureDetail): void
+    {
+        $targetStatusId = $this->resolveTargetStatusId('error');
+
+        try {
+            $this->authHelper->processUnguarded(function () use ($orderId, $jobId, $input, $failureDetail, $targetStatusId): void {
+                $this->tryPostResultComment($orderId, $input, 'error', '', [], false, $jobId, [], $failureDetail);
+
+                if ($targetStatusId !== null) {
+                    $this->updateOrderStatus($orderId, $targetStatusId);
+                }
+            });
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.statusUpdateFailed', [
+                'jobId'          => $jobId,
+                'orderId'        => $orderId,
+                'targetStatusId' => $targetStatusId,
+                'outputStatus'   => 'error',
+                'error'          => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
      * Best-effort internal order comment summarizing the address-check outcome
      * and the recommended next step. Never throws — a comment is supplementary
      * and must not roll back an address apply or status update. Caller wraps
      * this in processUnguarded.
      *
-     * @param bool $applied true when the corrected address was written (the
-     *                      comment then frames the snapshot as "before
-     *                      correction"); false for the not-applied outcomes
-     *                      (address left untouched).
+     * @param bool   $applied       true when the corrected address was written (the
+     *                              comment then frames the snapshot as "before
+     *                              correction"); false for the not-applied outcomes
+     *                              (address left untouched).
+     * @param array  $dhlMessages   DHL's own validation lines, rendered as-is when present.
+     * @param string $failureDetail set only for the no-verdict path (job failed / no output).
      */
-    private function tryPostResultComment(int $orderId, $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId): void
+    private function tryPostResultComment(int $orderId, $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId, array $dhlMessages = [], string $failureDetail = ''): void
     {
         $authorUserId = $this->resolveCommentAuthorUserId();
         if ($authorUserId === null) {
@@ -216,7 +259,7 @@ class AddressCheckApplyService
         try {
             $commentId = $this->createComment(
                 $orderId,
-                $this->formatResultComment($safeInput, $outputStatus, $outputReason, $changedFields, $applied, $jobId),
+                $this->formatResultComment($safeInput, $outputStatus, $outputReason, $changedFields, $applied, $jobId, $dhlMessages, $failureDetail),
                 $authorUserId
             );
             $this->report(__METHOD__, 'HeistaAddressCheck::log.commentCreated', [
@@ -289,10 +332,11 @@ class AddressCheckApplyService
      * merchants). Values are escaped in case a customer entered angle brackets.
      *
      * Leads with the outcome + a one-line next step so the operator knows what
-     * to do at a glance, then the changed fields (when applied), then the
-     * submitted address snapshot (revert reference / what we received).
+     * to do at a glance, then DHL's own messages (the only explanation a dhl_only
+     * merchant gets), then the changed fields (when applied), then the submitted
+     * address snapshot (revert reference / what we received).
      */
-    private function formatResultComment(array $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId): string
+    private function formatResultComment(array $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId, array $dhlMessages = [], string $failureDetail = ''): string
     {
         // postnumber is intentionally not in this list: Plenty keeps a post
         // number on every address, but it only matters for Packstation/
@@ -335,19 +379,49 @@ class AddressCheckApplyService
             }
         }
 
-        $snapshotLabel = $applied ? 'Originaladresse vor Korrektur' : 'Eingegangene Adresse (unverändert)';
+        // "vor Korrektur" would be a lie on a verified address, where nothing moved.
+        if (!$applied) {
+            $snapshotLabel = 'Eingegangene Adresse (unverändert)';
+        } elseif (empty($changedFields)) {
+            $snapshotLabel = 'Geprüfte Adresse (unverändert)';
+        } else {
+            $snapshotLabel = 'Originaladresse vor Korrektur';
+        }
 
         $body  = '<p><strong>Heista Adressprüfung</strong><br>';
         $body .= 'Ergebnis: ' . htmlspecialchars($this->statusLabel($outputStatus, $outputReason), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
         $body .= 'Nächster Schritt: ' . htmlspecialchars($this->nextStepText($outputStatus, $outputReason), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+
+        // DHL's verbatim validation lines. For a dhl_only merchant this is the entire
+        // explanation of the verdict — nothing else ran on that path.
+        $dhlRows = [];
+        foreach ($dhlMessages as $message) {
+            $text = trim((string) $message);
+            if ($text === '') {
+                continue;
+            }
+            $dhlRows[] = htmlspecialchars($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+        if (!empty($dhlRows)) {
+            $body .= '<p><strong>DHL-Meldungen:</strong><br>' . implode('<br>', $dhlRows) . '</p>';
+        }
+
+        if ($failureDetail !== '') {
+            $body .= '<p><strong>Details:</strong> '
+                   . htmlspecialchars($failureDetail, ENT_QUOTES | ENT_HTML5, 'UTF-8')
+                   . '<br>Die Adresse wurde NICHT verändert.</p>';
+        }
 
         if ($applied && !empty($changedFields)) {
             $body .= '<p><strong>Geänderte Felder:</strong> '
                    . htmlspecialchars($this->changedFieldsLabel($changedFields), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
         }
 
-        $body .= '<p><strong>' . htmlspecialchars($snapshotLabel, ENT_QUOTES | ENT_HTML5, 'UTF-8') . ':</strong><br>';
-        $body .= implode('<br>', $rows) . '</p>';
+        if (!empty($rows)) {
+            $body .= '<p><strong>' . htmlspecialchars($snapshotLabel, ENT_QUOTES | ENT_HTML5, 'UTF-8') . ':</strong><br>';
+            $body .= implode('<br>', $rows) . '</p>';
+        }
+
         $body .= '<p><em>Job-ID: ' . htmlspecialchars($jobId, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</em></p>';
 
         return $body;
@@ -361,14 +435,21 @@ class AddressCheckApplyService
      */
     private function statusLabel(string $outputStatus, string $outputReason = ''): string
     {
-        if ($outputReason === 'house_number_missing') {
-            return 'Nicht zustellbar (Hausnummer fehlt)';
-        }
-        if ($outputReason === 'street_not_confirmed') {
-            return 'Nicht zustellbar (Straße nicht bestätigt)';
-        }
-        if ($outputReason === 'town_corrected_review') {
-            return 'Prüfung empfohlen (Ort geändert)';
+        switch ($outputReason) {
+            // undeliverable — the status alone would just say "nicht gefunden", which is
+            // wrong for most of these: the address WAS found, one component failed.
+            case 'house_number_missing':       return 'Nicht zustellbar (Hausnummer fehlt)';
+            case 'street_not_confirmed':       return 'Nicht zustellbar (Straße nicht bestätigt)';
+            case 'postal_code_not_confirmed':  return 'Nicht zustellbar (PLZ nicht bestätigt)';
+            case 'dhl_rejected':               return 'Nicht zustellbar (von DHL abgelehnt)';
+
+            // review_suggested — the correction IS applied; say which field moved.
+            case 'postal_code_changed_review': return 'Prüfung empfohlen (PLZ geändert)';
+            case 'town_corrected_review':      return 'Prüfung empfohlen (Ort geändert)';
+            case 'partially_confirmed_review': return 'Prüfung empfohlen (Hausnummer nicht bestätigt)';
+
+            // verified
+            case 'dhl_confirmed':              return 'Bestätigt (DHL)';
         }
 
         switch ($outputStatus) {
@@ -390,20 +471,29 @@ class AddressCheckApplyService
      */
     private function nextStepText(string $outputStatus, string $outputReason = ''): string
     {
-        if ($outputReason === 'house_number_missing') {
-            return 'Hausnummer fehlt – beim Kunden anfordern und ergänzen.';
-        }
-        if ($outputReason === 'street_not_confirmed') {
-            return 'Straße konnte nicht bestätigt werden – beim Kunden prüfen (PLZ/Ort stimmen, Straße evtl. falsch).';
-        }
-        if ($outputReason === 'town_corrected_review') {
-            return 'Ort wurde automatisch geändert – bitte prüfen, ob der neue Ort stimmt (Original siehe unten, ggf. zurücksetzen).';
+        switch ($outputReason) {
+            case 'house_number_missing':
+                return 'Hausnummer fehlt – beim Kunden anfordern und ergänzen.';
+            case 'street_not_confirmed':
+                return 'Straße konnte nicht bestätigt werden – beim Kunden prüfen (PLZ/Ort stimmen, die Straße vermutlich nicht).';
+            case 'postal_code_not_confirmed':
+                return 'PLZ konnte nicht bestätigt werden – Straße und Ort stimmen, die korrekte PLZ beim Kunden erfragen.';
+            case 'dhl_rejected':
+                return 'DHL hat die Adresse abgelehnt – DHL-Meldungen unten prüfen und die Adresse mit dem Kunden klären.';
+            case 'postal_code_changed_review':
+                return 'PLZ wurde automatisch korrigiert – bitte prüfen, ob der neue Zustellort stimmt (Original siehe unten, ggf. zurücksetzen).';
+            case 'town_corrected_review':
+                return 'Ort wurde automatisch geändert – bitte prüfen, ob der neue Ort stimmt (Original siehe unten, ggf. zurücksetzen).';
+            case 'partially_confirmed_review':
+                return 'Straße und Ort sind bestätigt, die Hausnummer nicht – vor Versand kurz prüfen.';
+            case 'dhl_confirmed':
+                return 'Keine Aktion nötig – DHL hat die Adresse bestätigt.';
         }
 
         switch ($outputStatus) {
             case 'verified':           return 'Keine Aktion nötig – Adresse bestätigt.';
             case 'corrected':          return 'Optional prüfen – Felder wurden korrigiert (Original siehe unten).';
-            case 'review_suggested':   return 'Vor Versand kurz prüfen – Straße konnte nicht eindeutig bestätigt werden.';
+            case 'review_suggested':   return 'Vor Versand kurz prüfen – die Adresse konnte nicht vollständig bestätigt werden.';
             case 'undeliverable':      return 'Manuell prüfen oder Kunden kontaktieren – Adresse wurde nicht gefunden.';
             case 'postnumber_invalid': return 'Gültige Postnummer beim Kunden anfordern (Packstation/Postfiliale).';
             case 'email_required':     return 'E-Mail-Adresse beim Kunden anfordern – für den DPD-Versand erforderlich.';

@@ -15,6 +15,19 @@ class SaasClient
 {
     use Loggable;
 
+    /**
+     * Client identity reported to the SaaS on every call (X-Heista-Client /
+     * X-Heista-Client-Version). Merchants update the plugin on their own schedule, so this
+     * is the platform's ONLY way to see which builds are still live before changing the
+     * plugin-facing contract; the dashboard rolls it up per tenant.
+     *
+     * MUST be kept in step with "version" in plugin.json — bump both in the same commit.
+     * There is no runtime API to read the manifest version, so this constant is the source
+     * of truth for what we report.
+     */
+    const CLIENT_NAME    = 'HeistaAddressCheck';
+    const CLIENT_VERSION = '1.4.0';
+
     public function submitJob(string $baseUrl, string $apiKey, array $body, int $connectTimeoutMs = 5000): string
     {
         $created = $this->request('POST', rtrim($baseUrl, '/') . '/api/v1/jobs', $apiKey, $body, $connectTimeoutMs);
@@ -45,6 +58,8 @@ class SaasClient
         $headers = [
             'Authorization: Bearer ' . $apiKey,
             'Accept: application/json',
+            'X-Heista-Client: ' . self::CLIENT_NAME,
+            'X-Heista-Client-Version: ' . self::CLIENT_VERSION,
         ];
 
         curl_setopt_array($ch, [
