@@ -143,7 +143,7 @@ class AddressCheckApplyService
                     // The Postnummer lives in an AddressOption, not in an address
                     // column, so updateOrderAddress cannot reach it. Separate write,
                     // soft-fail — the address is already saved.
-                    $this->applyPostNumber((int) $row->deliveryAddressId, $corrected);
+                    $this->applyPostNumber((int) $row->deliveryAddressId, $corrected, $update);
 
                     // Always leave an internal note with the outcome + next step (the
                     // original address doubles as a revert reference) — 'verified'
@@ -602,22 +602,34 @@ class AddressCheckApplyService
      * Postfiliale BRANCH number (which station, a short numeric id); the Postnummer is
      * the customer's own DHL account number and lives in a separate AddressOption
      * record. The two hold different values on the same address — verified live
-     * (2026-07-14). Because it is not an address column, `updateOrderAddress` cannot
-     * reach it — hence this second write, via AddressRepositoryContract, whose address
-     * payload upserts on an `options` key of `[['typeId' => …, 'value' => …]]`
-     * (confirmed against the REST address endpoint, which shares the service).
+     * (2026-07-14). `updateOrderAddress` cannot reach the options, hence this second write.
      *
-     * `(addressId, typeId)` is UNIQUE — creating an option that already exists dies
-     * with a duplicate-key error — so look first and update in place when one is there.
+     * **How the option is written — and why NOT with the *Options methods.**
+     * `createAddressOptions()` / `updateAddressOptions()` look like the obvious contracts,
+     * but their `array $addressData` shape is undocumented; a first attempt at
+     * `['options' => [['typeId' => …, 'value' => …]]]` threw on a live order and the option
+     * was never created (silently, because the catch below used to log at `warning`, which
+     * Plenty does not surface — it now logs at `error`). What IS proven against the live
+     * REST address endpoint — which is backed by this same repository — is that a **full
+     * address payload carrying an `options` key upserts that option in place**, leaving the
+     * address's other options untouched. So we pass the address fields we just wrote, plus
+     * the option. Idempotent: it creates the option when absent and overwrites it when
+     * present, so no lookup and no create/update branch is needed (`(addressId, typeId)` is
+     * UNIQUE, so a blind create WOULD fail on a duplicate).
      *
-     * Only Packstation/Postfiliale addresses carry a post number. The cleanup never
-     * invents one: it echoes what was submitted, or lifts it out of a free-text field
-     * the customer typed it into (which is the case this write exists for).
+     * Only Packstation/Postfiliale addresses carry a post number. The cleanup never invents
+     * one: it echoes what was submitted, or lifts it out of a free-text field the customer
+     * typed it into (e.g. a post number pasted into the street line, ahead of the word
+     * "Packstation") — which is the case this write exists for.
      *
-     * Soft-fail: the address itself is already saved and must not be rolled back over
-     * a post-number problem.
+     * Soft-fail: the address itself is already saved and must not be rolled back over a
+     * post-number problem.
+     *
+     * @param array $addressUpdate The mapped address fields just written by the caller.
+     *                             Re-sent here because the option upsert rides along with a
+     *                             full, valid address payload.
      */
-    private function applyPostNumber(int $addressId, array $corrected): void
+    private function applyPostNumber(int $addressId, array $corrected, array $addressUpdate): void
     {
         $isSpecial = !empty($corrected['isPackstation']) || !empty($corrected['isPostfiliale']);
         if (!$isSpecial || $addressId <= 0) {
@@ -636,7 +648,7 @@ class AddressCheckApplyService
         // Postfiliale order — that one wrongly applied this rule to the BRANCH number
         // (3-4 digits), which is a different field entirely.
         if (preg_match('/^[0-9]{6,10}$/', $postNumber) !== 1) {
-            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.postNumberRejected', [
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.postNumberRejected', [
                 'addressId'  => $addressId,
                 'postNumber' => $postNumber,
             ]);
@@ -644,41 +656,41 @@ class AddressCheckApplyService
         }
 
         try {
-            $existing = $this->addressRepo->findAddressOptions($addressId, AddressOption::TYPE_POST_NUMBER);
-
-            $current = null;
-            foreach ($existing as $option) {
-                if ((int) ($option->typeId ?? 0) === AddressOption::TYPE_POST_NUMBER) {
-                    $current = $option;
-                    break;
-                }
-            }
-
-            // Already correct — don't churn the record (and don't log a change that
-            // didn't happen).
-            if ($current !== null && trim((string) ($current->value ?? '')) === $postNumber) {
-                return;
-            }
-
-            $payload = ['options' => [[
+            $payload            = $addressUpdate;
+            $payload['options'] = [[
                 'typeId' => AddressOption::TYPE_POST_NUMBER,
                 'value'  => $postNumber,
-            ]]];
+            ]];
 
-            if ($current !== null) {
-                $this->addressRepo->updateAddressOptions($payload, $addressId);
-            } else {
-                $this->addressRepo->createAddressOptions($payload, $addressId);
-            }
+            $this->addressRepo->updateAddress($payload, $addressId);
 
             $this->report(__METHOD__, 'HeistaAddressCheck::log.postNumberApplied', [
                 'addressId' => $addressId,
-                'created'   => $current === null ? '1' : '0',
             ]);
         } catch (Throwable $e) {
-            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.postNumberFailed', [
-                'addressId' => $addressId,
-                'error'     => $e->getMessage(),
+            // error(), not warning(): Plenty only guarantees error-level entries in the log,
+            // and a silent failure here is exactly how the first attempt went unnoticed.
+            //
+            // A ValidationException's own message is the useless string "validation error
+            // found" — the field that actually failed is only in its message bag, so unpack
+            // it (same treatment tryPostResultComment gives the comment endpoint).
+            $validationDetails = '';
+            if ($e instanceof ValidationException) {
+                try {
+                    $bag = $e->getMessageBag();
+                    $validationDetails = is_object($bag)
+                        ? (string) json_encode($bag->toArray(), JSON_UNESCAPED_UNICODE)
+                        : '';
+                } catch (Throwable $inner) {
+                    $validationDetails = 'unreadable: ' . $inner->getMessage();
+                }
+            }
+
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.postNumberFailed', [
+                'addressId'         => $addressId,
+                'error'             => $e->getMessage(),
+                'class'             => get_class($e),
+                'validationDetails' => $validationDetails,
             ]);
         }
     }
