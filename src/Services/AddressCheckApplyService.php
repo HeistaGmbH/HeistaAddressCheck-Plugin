@@ -454,6 +454,10 @@ class AddressCheckApplyService
             case 'postal_code_not_confirmed':  return 'Nicht zustellbar (PLZ nicht bestätigt)';
             case 'dhl_rejected':               return 'Nicht zustellbar (von DHL abgelehnt)';
 
+            // postnumber_invalid — a Packstation/Postfiliale is undeliverable without the
+            // customer's Postnummer, whether it is absent or malformed. Not the station number.
+            case 'postnumber_missing':         return 'Nicht zustellbar (Postnummer fehlt)';
+
             // review_suggested — the correction IS applied; say which field moved.
             case 'postal_code_changed_review': return 'Prüfung empfohlen (PLZ geändert)';
             case 'town_corrected_review':      return 'Prüfung empfohlen (Ort geändert)';
@@ -491,6 +495,8 @@ class AddressCheckApplyService
                 return 'PLZ konnte nicht bestätigt werden – Straße und Ort stimmen, die korrekte PLZ beim Kunden erfragen.';
             case 'dhl_rejected':
                 return 'DHL hat die Adresse abgelehnt – DHL-Meldungen unten prüfen und die Adresse mit dem Kunden klären.';
+            case 'postnumber_missing':
+                return 'Postnummer fehlt – ohne sie kann DHL nicht an Packstation/Postfiliale zustellen. Beim Kunden anfordern (nicht die Stationsnummer).';
             case 'postal_code_changed_review':
                 return 'PLZ wurde automatisch korrigiert – bitte prüfen, ob der neue Zustellort stimmt (Original siehe unten, ggf. zurücksetzen).';
             case 'town_corrected_review':
