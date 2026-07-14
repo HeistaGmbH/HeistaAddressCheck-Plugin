@@ -5,7 +5,9 @@ namespace HeistaAddressCheck\Services;
 use HeistaAddressCheck\Models\PendingAddressCheck;
 use HeistaAddressCheck\PlatformEnvironment;
 use HeistaAddressCheck\Repositories\PendingAddressCheckRepository;
+use Plenty\Modules\Account\Address\Contracts\AddressRepositoryContract;
 use Plenty\Modules\Account\Address\Models\Address;
+use Plenty\Modules\Account\Address\Models\AddressOption;
 use Plenty\Modules\Account\Address\Models\AddressRelationType;
 use Plenty\Modules\Authorization\Services\AuthHelper;
 use Plenty\Modules\Order\Address\Contracts\OrderAddressRepositoryContract;
@@ -26,6 +28,7 @@ class AddressCheckSubmitService
 
     private SaasClient $saasClient;
     private OrderAddressRepositoryContract $orderAddressRepo;
+    private AddressRepositoryContract $addressRepo;
     private OrderRepositoryContract $orderRepo;
     private CountryRepositoryContract $countryRepo;
     private PendingAddressCheckRepository $pendingRepo;
@@ -35,6 +38,7 @@ class AddressCheckSubmitService
     public function __construct(
         SaasClient $saasClient,
         OrderAddressRepositoryContract $orderAddressRepo,
+        AddressRepositoryContract $addressRepo,
         OrderRepositoryContract $orderRepo,
         CountryRepositoryContract $countryRepo,
         PendingAddressCheckRepository $pendingRepo,
@@ -43,6 +47,7 @@ class AddressCheckSubmitService
     ) {
         $this->saasClient       = $saasClient;
         $this->orderAddressRepo = $orderAddressRepo;
+        $this->addressRepo      = $addressRepo;
         $this->orderRepo        = $orderRepo;
         $this->countryRepo      = $countryRepo;
         $this->pendingRepo      = $pendingRepo;
@@ -197,7 +202,10 @@ class AddressCheckSubmitService
             'addressLine2'  => (string) ($address->address4    ?: ''),
             'isPackstation' => (bool)   ($address->isPackstation ?? false),
             'isPostfiliale' => (bool)   ($address->isPostfiliale ?? false),
-            'postnumber'    => (string) ($address->packstationNo ?: ''),
+            // NOT $address->packstationNo — that accessor mirrors address2, i.e. the
+            // Packstation STATION number, which we already send as houseNumber. The real
+            // Postnummer lives in AddressOption type 6. See resolvePostNumber().
+            'postnumber'    => $this->resolvePostNumber((int) $address->id, $address),
             // Carrier key (dhl/dpd/...) from the shipping profile; empty when
             // unmapped. Must match the provider keys the backend expects.
             'shippingProvider' => $shippingProvider,
@@ -215,6 +223,76 @@ class AddressCheckSubmitService
         }
 
         return $payload;
+    }
+
+    /**
+     * Resolve the customer's DHL Postnummer from AddressOption TYPE_POST_NUMBER (6).
+     *
+     * **Do NOT use `$address->packstationNo` for this.** That accessor mirrors the
+     * `address2` column, which on a Packstation holds the STATION number (which locker,
+     * ~3 digits) — the very value we already send as `houseNumber`. Verified live
+     * 2026-07-14: a Packstation order submitted `postnumber: "209"` (the station) while
+     * the customer's real 9-digit Postnummer sat untouched in option 6. Downstream, DHL
+     * answered `The given Post number is not valid` — because it wasn't a post number.
+     *
+     * The two are different fields with different rules: the station number goes in
+     * DHL's `lockerID`, the Postnummer in `postNumber` (`^[0-9]{6,10}$`).
+     *
+     * Prefers the options already loaded on the model and falls back to an explicit
+     * lookup. Returns '' when the address has no post number — the backend then lets DHL
+     * say so ("Please enter a Postnummer"), which is the correct verdict for a locker
+     * delivery that cannot be made.
+     */
+    private function resolvePostNumber(int $addressId, Address $address): string
+    {
+        $fromModel = $this->postNumberFromOptions($address->options ?? []);
+        if ($fromModel !== '') {
+            return $fromModel;
+        }
+
+        if ($addressId <= 0) {
+            return '';
+        }
+
+        try {
+            $options = $this->addressRepo->findAddressOptions($addressId, AddressOption::TYPE_POST_NUMBER);
+            return $this->postNumberFromOptions($options);
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.postNumberLookupFailed', [
+                'addressId' => $addressId,
+                'error'     => $e->getMessage(),
+            ]);
+            return '';
+        }
+    }
+
+    /**
+     * Pick the TYPE_POST_NUMBER value out of an address-option list. Iterates directly so
+     * it works for both arrays and Plenty Collections, and tolerates array- or
+     * object-shaped entries.
+     */
+    private function postNumberFromOptions($options): string
+    {
+        foreach (($options ?: []) as $option) {
+            if (is_object($option)) {
+                $typeId = $option->typeId ?? null;
+                $value  = $option->value ?? '';
+            } elseif (is_array($option)) {
+                $typeId = $option['typeId'] ?? null;
+                $value  = $option['value'] ?? '';
+            } else {
+                continue;
+            }
+
+            if ((int) $typeId === AddressOption::TYPE_POST_NUMBER) {
+                $value = trim((string) $value);
+                if ($value !== '') {
+                    return $value;
+                }
+            }
+        }
+
+        return '';
     }
 
     /**

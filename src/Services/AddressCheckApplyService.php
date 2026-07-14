@@ -629,12 +629,13 @@ class AddressCheckApplyService
             return;
         }
 
-        // Sanity gate: a Postnummer is a digit string. Anything else is a cleanup
-        // slip-up, and writing garbage into the option is worse than leaving the
-        // merchant's own value alone. This is NOT the old n8n length check that once
-        // rejected every Postfiliale order — that one wrongly validated the BRANCH
-        // number (3-4 digits) as if it were the post number.
-        if (preg_match('/^[0-9]{4,12}$/', $postNumber) !== 1) {
+        // Sanity gate: DHL's own contract for the Postnummer is `^[0-9]{6,10}$` (Parcel DE
+        // Shipping schema, Locker.postNumber). A value outside it cannot ship to a locker
+        // anyway, and writing garbage into the option is worse than leaving the merchant's
+        // own value alone. This is NOT the old n8n length check that once rejected every
+        // Postfiliale order — that one wrongly applied this rule to the BRANCH number
+        // (3-4 digits), which is a different field entirely.
+        if (preg_match('/^[0-9]{6,10}$/', $postNumber) !== 1) {
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.postNumberRejected', [
                 'addressId'  => $addressId,
                 'postNumber' => $postNumber,
