@@ -107,16 +107,14 @@ class AddressCheckApplyService
         }
 
         $outputStatus  = (string) ($output['status'] ?? '');
-        $outputReason  = (string) ($output['reason'] ?? '');
         $isValid       = !empty($output['isValid']);
         $corrected     = $output['corrected'] ?? null;
         $input         = is_array($item) ? ($item['input'] ?? null) : null;
-        $changedFields = is_array($output['changedFields'] ?? null) ? $output['changedFields'] : [];
 
-        // DHL's own validation messages. Empty unless a DHL mode ran — and in dhl_only
-        // they are the ONLY explanation for a rejection (no Google check runs on that
-        // path), so the comment must surface them.
-        $dhlMessages = is_array($output['dhlMessages'] ?? null) ? $output['dhlMessages'] : [];
+        // Everything else the comment needs (reason, changedFields, dhlMessages, suggestion,
+        // unconfirmedFields) is read from $output where it is rendered — the whole payload is
+        // passed down rather than unpacked into one parameter per field, so a new contract
+        // field only touches formatResultComment().
 
         // Resolve the configured target status for this outcome up front,
         // whether or not we apply the address. Empty/non-numeric is skipped.
@@ -124,14 +122,14 @@ class AddressCheckApplyService
 
         // Apply the correction whenever the result is valid and a structured
         // corrected payload came back. Covers 'verified', 'corrected' and
-        // 'review_suggested' (cleaned but Google flagged for a human). We still
+        // 'review_suggested' (cleaned, but flagged for a human). We still
         // set the configured status and keep the original address as an internal
         // comment so the merchant can revert a bad correction.
         $shouldApplyAddress = $isValid && is_array($corrected);
 
         if ($shouldApplyAddress) {
             try {
-                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $outputStatus, $outputReason, $changedFields, $dhlMessages, $jobId, $targetStatusId): void {
+                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $output, $jobId, $targetStatusId): void {
                     $update = $this->mapCorrectedToPlentyFields($corrected);
                     $this->orderAddressRepo->updateOrderAddress(
                         $update,
@@ -151,7 +149,7 @@ class AddressCheckApplyService
                     // found, and on a DHL mode the note carries DHL's own messages.
                     // Soft-fail: tryPostResultComment never throws, so a comment problem
                     // can't roll back the address apply.
-                    $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, true, $jobId, $dhlMessages);
+                    $this->tryPostResultComment($orderId, $input, $output, true, $jobId);
 
                     // Status update in the same processUnguarded to avoid
                     // re-auth. Address is already saved, so a bad statusId
@@ -172,25 +170,29 @@ class AddressCheckApplyService
 
             $this->pendingRepo->markApplied($row);
 
+            // `outputReason` replaces the raw upstream verdict we used to report here: it says
+            // the same thing in the contract's own vocabulary, without naming the services the
+            // check runs on. How the check reaches its verdict is not for the log.
             $this->report(__METHOD__, 'HeistaAddressCheck::log.applied', [
                 'jobId'           => $jobId,
                 'orderId'         => $orderId,
                 'outputStatus'    => $outputStatus,
-                'googleStatus'    => (string) ($output['googleStatus']    ?? ''),
+                'outputReason'    => (string) ($output['reason'] ?? ''),
                 'creditsConsumed' => (int)    ($output['creditsConsumed'] ?? 0),
                 'targetStatusId'  => $targetStatusId,
             ]);
             return;
         }
 
-        // No usable correction (undeliverable, postnumber_invalid, error). Leave
-        // the address untouched, but post an internal note explaining what Heista
-        // found and the recommended next step, and set the configured status so
-        // the merchant can route it to a review queue. Row is marked FAILED to
-        // reflect that the address wasn't applied.
+        // No usable correction (undeliverable — including address_conflict, where Heista
+        // deliberately refused to pick between two candidate addresses — postnumber_invalid,
+        // error). Leave the address untouched, but post an internal note explaining what
+        // Heista found (on address_conflict that note carries the suggested address) and the
+        // recommended next step, and set the configured status so the merchant can route it to
+        // a review queue. Row is marked FAILED to reflect that the address wasn't applied.
         try {
-            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $outputStatus, $outputReason, $changedFields, $dhlMessages, $jobId): void {
-                $this->tryPostResultComment($orderId, $input, $outputStatus, $outputReason, $changedFields, false, $jobId, $dhlMessages);
+            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $output, $jobId): void {
+                $this->tryPostResultComment($orderId, $input, $output, false, $jobId);
 
                 if ($targetStatusId !== null) {
                     $this->updateOrderStatus($orderId, $targetStatusId);
@@ -224,7 +226,7 @@ class AddressCheckApplyService
 
         try {
             $this->authHelper->processUnguarded(function () use ($orderId, $jobId, $input, $failureDetail, $targetStatusId): void {
-                $this->tryPostResultComment($orderId, $input, 'error', '', [], false, $jobId, [], $failureDetail);
+                $this->tryPostResultComment($orderId, $input, ['status' => 'error'], false, $jobId, $failureDetail);
 
                 if ($targetStatusId !== null) {
                     $this->updateOrderStatus($orderId, $targetStatusId);
@@ -247,14 +249,18 @@ class AddressCheckApplyService
      * and must not roll back an address apply or status update. Caller wraps
      * this in processUnguarded.
      *
+     * @param array  $output        the SaaS per-item output verbatim (status, reason,
+     *                              changedFields, dhlMessages, suggestion, unconfirmedFields).
+     *                              Passed whole so a new contract field only touches
+     *                              formatResultComment(); ['status' => 'error'] on the
+     *                              no-verdict path, where there is no output.
      * @param bool   $applied       true when the corrected address was written (the
      *                              comment then frames the snapshot as "before
      *                              correction"); false for the not-applied outcomes
      *                              (address left untouched).
-     * @param array  $dhlMessages   DHL's own validation lines, rendered as-is when present.
      * @param string $failureDetail set only for the no-verdict path (job failed / no output).
      */
-    private function tryPostResultComment(int $orderId, $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId, array $dhlMessages = [], string $failureDetail = ''): void
+    private function tryPostResultComment(int $orderId, $input, array $output, bool $applied, string $jobId, string $failureDetail = ''): void
     {
         $authorUserId = $this->resolveCommentAuthorUserId();
         if ($authorUserId === null) {
@@ -270,7 +276,7 @@ class AddressCheckApplyService
         try {
             $commentId = $this->createComment(
                 $orderId,
-                $this->formatResultComment($safeInput, $outputStatus, $outputReason, $changedFields, $applied, $jobId, $dhlMessages, $failureDetail),
+                $this->formatResultComment($safeInput, $output, $applied, $jobId, $failureDetail),
                 $authorUserId
             );
             $this->report(__METHOD__, 'HeistaAddressCheck::log.commentCreated', [
@@ -344,11 +350,29 @@ class AddressCheckApplyService
      *
      * Leads with the outcome + a one-line next step so the operator knows what
      * to do at a glance, then DHL's own messages (the only explanation a dhl_only
-     * merchant gets), then the changed fields (when applied), then the submitted
-     * address snapshot (revert reference / what we received).
+     * merchant gets), then the address Heista found but did NOT apply (address_conflict),
+     * then the changed fields (when applied), then the submitted address snapshot
+     * (revert reference / what we received).
      */
-    private function formatResultComment(array $input, string $outputStatus, string $outputReason, array $changedFields, bool $applied, string $jobId, array $dhlMessages = [], string $failureDetail = ''): string
+    private function formatResultComment(array $input, array $output, bool $applied, string $jobId, string $failureDetail = ''): string
     {
+        $outputStatus  = (string) ($output['status'] ?? '');
+        $outputReason  = (string) ($output['reason'] ?? '');
+        $changedFields = is_array($output['changedFields'] ?? null) ? $output['changedFields'] : [];
+
+        // DHL's own validation messages. Empty unless a DHL mode ran — and in dhl_only
+        // they are the ONLY explanation for a rejection (Heista's own check never runs on
+        // that path), so the comment must surface them.
+        $dhlMessages = is_array($output['dhlMessages'] ?? null) ? $output['dhlMessages'] : [];
+
+        // The address Heista found but deliberately did NOT apply, plus the fields the check
+        // refused to confirm. Present on address_conflict: the postal area the customer typed
+        // could not be confirmed, while the same street + house number was placed in a different
+        // one. Two candidate addresses, no arbiter — so the merchant decides, and without this
+        // block they would see the flag but not the evidence.
+        $suggestion  = is_array($output['suggestion'] ?? null) ? $output['suggestion'] : [];
+        $unconfirmed = is_array($output['unconfirmedFields'] ?? null) ? $output['unconfirmedFields'] : [];
+
         // postnumber is intentionally not in this list: Plenty keeps a post
         // number on every address, but it only matters for Packstation/
         // Postfiliale. It's rendered below, gated on those flags.
@@ -417,6 +441,35 @@ class AddressCheckApplyService
             $body .= '<p><strong>DHL-Meldungen:</strong><br>' . implode('<br>', $dhlRows) . '</p>';
         }
 
+        // The rival address. Rendered as a suggestion, NEVER applied — Heista refused to pick
+        // between it and the submitted address on purpose, and the merchant is the one who can
+        // ask the customer. Rendered street-line + city-line so it reads like an address;
+        // Heista's one-line `formatted` is the fallback if the structured parts are missing.
+        $suggestionLine = trim((string) ($suggestion['formatted'] ?? ''));
+        $suggestionStreet = trim((string) ($suggestion['street'] ?? '') . ' ' . (string) ($suggestion['houseNumber'] ?? ''));
+        $suggestionCity   = trim((string) ($suggestion['postalCode'] ?? '') . ' ' . (string) ($suggestion['city'] ?? ''));
+        if ($suggestionStreet !== '' || $suggestionCity !== '' || $suggestionLine !== '') {
+            $body .= '<p><strong>Adress-Vorschlag (NICHT übernommen):</strong><br>';
+            if ($suggestionStreet !== '') {
+                $body .= htmlspecialchars($suggestionStreet, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
+            }
+            if ($suggestionCity !== '') {
+                $body .= htmlspecialchars($suggestionCity, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
+            }
+            if ($suggestionLine !== '' && $suggestionStreet === '' && $suggestionCity === '') {
+                $body .= htmlspecialchars($suggestionLine, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
+            }
+            $body .= '<em>Von der Adressprüfung gefunden, aber nicht automatisch übernommen – bitte mit dem Kunden klären.</em></p>';
+        }
+
+        // Which fields the check would not confirm. An unconfirmed house number alone is normal
+        // for valid German addresses (interpolated numbers), so this is context, not a verdict.
+        $unconfirmedLabel = $this->changedFieldsLabel($unconfirmed);
+        if ($unconfirmedLabel !== '') {
+            $body .= '<p><strong>Nicht bestätigte Felder:</strong> '
+                   . htmlspecialchars($unconfirmedLabel, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+        }
+
         if ($failureDetail !== '') {
             $body .= '<p><strong>Details:</strong> '
                    . htmlspecialchars($failureDetail, ENT_QUOTES | ENT_HTML5, 'UTF-8')
@@ -453,6 +506,9 @@ class AddressCheckApplyService
             case 'street_not_confirmed':       return 'Nicht zustellbar (Straße nicht bestätigt)';
             case 'postal_code_not_confirmed':  return 'Nicht zustellbar (PLZ nicht bestätigt)';
             case 'dhl_rejected':               return 'Nicht zustellbar (von DHL abgelehnt)';
+            // Two candidate addresses, no arbiter — Heista refused to guess, so the address
+            // was deliberately NOT changed. The rival is in the Adress-Vorschlag block.
+            case 'address_conflict':           return 'Nicht zustellbar (Adresse nicht eindeutig)';
 
             // postnumber_invalid — a Packstation/Postfiliale is undeliverable without the
             // customer's Postnummer, whether it is absent or malformed. Not the station number.
@@ -495,6 +551,8 @@ class AddressCheckApplyService
                 return 'PLZ konnte nicht bestätigt werden – Straße und Ort stimmen, die korrekte PLZ beim Kunden erfragen.';
             case 'dhl_rejected':
                 return 'DHL hat die Adresse abgelehnt – DHL-Meldungen unten prüfen und die Adresse mit dem Kunden klären.';
+            case 'address_conflict':
+                return 'PLZ/Ort konnten nicht bestätigt werden, die Straße liegt laut Prüfung in einem anderen Zustellgebiet – die Adresse wurde NICHT geändert. Adress-Vorschlag unten prüfen und mit dem Kunden klären.';
             case 'postnumber_missing':
                 return 'Postnummer fehlt – ohne sie kann DHL nicht an Packstation/Postfiliale zustellen. Beim Kunden anfordern (nicht die Stationsnummer).';
             case 'postal_code_changed_review':
@@ -520,8 +578,9 @@ class AddressCheckApplyService
     }
 
     /**
-     * Map the machine field keys Heista returns in changedFields to the German
-     * labels used elsewhere in the comment; join for display.
+     * Map the machine field keys Heista returns (changedFields, unconfirmedFields —
+     * same key vocabulary) to the German labels used elsewhere in the comment; join
+     * for display. Empty list → empty string, which the caller uses to skip the block.
      */
     private function changedFieldsLabel(array $changedFields): string
     {
@@ -650,8 +709,8 @@ class AddressCheckApplyService
         // Sanity gate: DHL's own contract for the Postnummer is `^[0-9]{6,10}$` (Parcel DE
         // Shipping schema, Locker.postNumber). A value outside it cannot ship to a locker
         // anyway, and writing garbage into the option is worse than leaving the merchant's
-        // own value alone. This is NOT the old n8n length check that once rejected every
-        // Postfiliale order — that one wrongly applied this rule to the BRANCH number
+        // own value alone. This is NOT the old backend-side length check that once rejected
+        // every Postfiliale order — that one wrongly applied this rule to the BRANCH number
         // (3-4 digits), which is a different field entirely.
         if (preg_match('/^[0-9]{6,10}$/', $postNumber) !== 1) {
             $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.postNumberRejected', [

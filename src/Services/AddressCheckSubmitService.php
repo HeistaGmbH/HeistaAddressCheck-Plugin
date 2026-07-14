@@ -76,10 +76,11 @@ class AddressCheckSubmitService
         $devOverride = trim((string) $this->config->get('HeistaAddressCheck.devApiBaseUrlOverride'));
         $apiBaseUrl  = PlatformEnvironment::baseUrlFor($environment, $devOverride);
 
-        // Optional endpoint override, sent as config._n8nEndpoint to route this
-        // shop to an alternate backend workflow instead of the default. Leave
-        // empty in production.
-        $n8nEndpointOverride = trim((string) $this->config->get('HeistaAddressCheck.devN8nEndpointOverride'));
+        // Optional internal endpoint override, routing this shop to an alternate backend
+        // workflow instead of the default. Leave empty in production. The payload key below
+        // is a legacy contract field name the platform still expects — keep it out of
+        // merchant-facing text.
+        $endpointOverride = trim((string) $this->config->get('HeistaAddressCheck.devN8nEndpointOverride'));
 
         try {
             $address = $this->orderAddressRepo->findAddressByType($orderId, AddressRelationType::DELIVERY_ADDRESS);
@@ -113,7 +114,7 @@ class AddressCheckSubmitService
             'plentyId'    => (int) pluginApp(Application::class)->getPlentyId(),
             'callbackUrl' => $callbackUrl,
         ]);
-        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $n8nEndpointOverride, $shippingProvider, $email);
+        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $endpointOverride, $shippingProvider, $email);
 
         try {
             $jobId = $this->saasClient->submitJob($apiBaseUrl, $apiKey, $payload);
@@ -171,7 +172,7 @@ class AddressCheckSubmitService
         return 'https://p' . $plentyId . '.my.plentysystems.com/rest/heista/address-check/callback';
     }
 
-    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $n8nEndpointOverride = '', string $shippingProvider = '', string $email = ''): array
+    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $endpointOverride = '', string $shippingProvider = '', string $email = ''): array
     {
         $countryIso = '';
         if (!empty($address->countryId)) {
@@ -218,8 +219,8 @@ class AddressCheckSubmitService
             'items'          => [$item],
         ];
 
-        if ($n8nEndpointOverride !== '') {
-            $payload['config'] = ['_n8nEndpoint' => $n8nEndpointOverride];
+        if ($endpointOverride !== '') {
+            $payload['config'] = ['_n8nEndpoint' => $endpointOverride];
         }
 
         return $payload;
