@@ -154,7 +154,7 @@ class AddressCheckSubmitService
         // configures it. The *.my.plentysystems.com system host always serves
         // /rest/ regardless of storefront, so this works even on headless PWA
         // shops. plentyId == the `p<N>` number in the system URL
-        // (verified: plentyId 15950 -> p15950.my.plentysystems.com).
+        // (verified live against a real system: getPlentyId() N -> pN.my.plentysystems.com).
         $plentyId = (int) pluginApp(Application::class)->getPlentyId();
         if ($plentyId <= 0) {
             // No plenty context -> can't build an absolute host. Return empty so

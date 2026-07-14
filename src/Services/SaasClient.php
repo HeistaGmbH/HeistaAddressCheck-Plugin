@@ -26,7 +26,7 @@ class SaasClient
      * of truth for what we report.
      */
     const CLIENT_NAME    = 'HeistaAddressCheck';
-    const CLIENT_VERSION = '1.4.0';
+    const CLIENT_VERSION = '1.5.0';
 
     public function submitJob(string $baseUrl, string $apiKey, array $body, int $connectTimeoutMs = 5000): string
     {

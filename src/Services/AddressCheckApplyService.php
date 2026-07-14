@@ -4,6 +4,9 @@ namespace HeistaAddressCheck\Services;
 
 use HeistaAddressCheck\Models\PendingAddressCheck;
 use HeistaAddressCheck\Repositories\PendingAddressCheckRepository;
+use Plenty\Modules\Account\Address\Contracts\AddressRepositoryContract;
+use Plenty\Modules\Account\Address\Models\Address;
+use Plenty\Modules\Account\Address\Models\AddressOption;
 use Plenty\Modules\Account\Address\Models\AddressRelationType;
 use Plenty\Modules\Authorization\Services\AuthHelper;
 use Plenty\Exceptions\ValidationException;
@@ -30,6 +33,7 @@ class AddressCheckApplyService
 
     private PendingAddressCheckRepository $pendingRepo;
     private OrderAddressRepositoryContract $orderAddressRepo;
+    private AddressRepositoryContract $addressRepo;
     private OrderRepositoryContract $orderRepo;
     private CountryRepositoryContract $countryRepo;
     private CommentRepositoryContract $commentRepo;
@@ -39,6 +43,7 @@ class AddressCheckApplyService
     public function __construct(
         PendingAddressCheckRepository $pendingRepo,
         OrderAddressRepositoryContract $orderAddressRepo,
+        AddressRepositoryContract $addressRepo,
         OrderRepositoryContract $orderRepo,
         CountryRepositoryContract $countryRepo,
         CommentRepositoryContract $commentRepo,
@@ -47,6 +52,7 @@ class AddressCheckApplyService
     ) {
         $this->pendingRepo      = $pendingRepo;
         $this->orderAddressRepo = $orderAddressRepo;
+        $this->addressRepo      = $addressRepo;
         $this->orderRepo        = $orderRepo;
         $this->countryRepo      = $countryRepo;
         $this->commentRepo      = $commentRepo;
@@ -133,6 +139,11 @@ class AddressCheckApplyService
                         $orderId,
                         AddressRelationType::DELIVERY_ADDRESS
                     );
+
+                    // The Postnummer lives in an AddressOption, not in an address
+                    // column, so updateOrderAddress cannot reach it. Separate write,
+                    // soft-fail — the address is already saved.
+                    $this->applyPostNumber((int) $row->deliveryAddressId, $corrected);
 
                     // Always leave an internal note with the outcome + next step (the
                     // original address doubles as a revert reference) — 'verified'
@@ -583,6 +594,94 @@ class AddressCheckApplyService
         $this->orderRepo->updateOrder(['statusId' => $statusId], $orderId);
     }
 
+    /**
+     * Write the customer's DHL Postnummer into the address's AddressOption
+     * TYPE_POST_NUMBER (6). Caller wraps this in processUnguarded.
+     *
+     * **The post number is not `address2`.** address2 holds the Packstation /
+     * Postfiliale BRANCH number (which station, a short numeric id); the Postnummer is
+     * the customer's own DHL account number and lives in a separate AddressOption
+     * record. The two hold different values on the same address — verified live
+     * (2026-07-14). Because it is not an address column, `updateOrderAddress` cannot
+     * reach it — hence this second write, via AddressRepositoryContract, whose address
+     * payload upserts on an `options` key of `[['typeId' => …, 'value' => …]]`
+     * (confirmed against the REST address endpoint, which shares the service).
+     *
+     * `(addressId, typeId)` is UNIQUE — creating an option that already exists dies
+     * with a duplicate-key error — so look first and update in place when one is there.
+     *
+     * Only Packstation/Postfiliale addresses carry a post number. The cleanup never
+     * invents one: it echoes what was submitted, or lifts it out of a free-text field
+     * the customer typed it into (which is the case this write exists for).
+     *
+     * Soft-fail: the address itself is already saved and must not be rolled back over
+     * a post-number problem.
+     */
+    private function applyPostNumber(int $addressId, array $corrected): void
+    {
+        $isSpecial = !empty($corrected['isPackstation']) || !empty($corrected['isPostfiliale']);
+        if (!$isSpecial || $addressId <= 0) {
+            return;
+        }
+
+        $postNumber = trim((string) ($corrected['postnumber'] ?? ''));
+        if ($postNumber === '') {
+            return;
+        }
+
+        // Sanity gate: a Postnummer is a digit string. Anything else is a cleanup
+        // slip-up, and writing garbage into the option is worse than leaving the
+        // merchant's own value alone. This is NOT the old n8n length check that once
+        // rejected every Postfiliale order — that one wrongly validated the BRANCH
+        // number (3-4 digits) as if it were the post number.
+        if (preg_match('/^[0-9]{4,12}$/', $postNumber) !== 1) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.postNumberRejected', [
+                'addressId'  => $addressId,
+                'postNumber' => $postNumber,
+            ]);
+            return;
+        }
+
+        try {
+            $existing = $this->addressRepo->findAddressOptions($addressId, AddressOption::TYPE_POST_NUMBER);
+
+            $current = null;
+            foreach ($existing as $option) {
+                if ((int) ($option->typeId ?? 0) === AddressOption::TYPE_POST_NUMBER) {
+                    $current = $option;
+                    break;
+                }
+            }
+
+            // Already correct — don't churn the record (and don't log a change that
+            // didn't happen).
+            if ($current !== null && trim((string) ($current->value ?? '')) === $postNumber) {
+                return;
+            }
+
+            $payload = ['options' => [[
+                'typeId' => AddressOption::TYPE_POST_NUMBER,
+                'value'  => $postNumber,
+            ]]];
+
+            if ($current !== null) {
+                $this->addressRepo->updateAddressOptions($payload, $addressId);
+            } else {
+                $this->addressRepo->createAddressOptions($payload, $addressId);
+            }
+
+            $this->report(__METHOD__, 'HeistaAddressCheck::log.postNumberApplied', [
+                'addressId' => $addressId,
+                'created'   => $current === null ? '1' : '0',
+            ]);
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.postNumberFailed', [
+                'addressId' => $addressId,
+                'error'     => $e->getMessage(),
+            ]);
+        }
+    }
+
     private function mapCorrectedToPlentyFields(array $corrected): array
     {
         // The backend order view reads the legacy numbered columns (name1..4,
@@ -590,19 +689,34 @@ class AddressCheckApplyService
         // write the numbered set. Mirrors the working PUT to
         // /rest/orders/{id}/addresses/{addrId}.
         $update = [
-            'name1'         => (string) ($corrected['company']      ?? ''),
-            'name2'         => (string) ($corrected['firstName']    ?? ''),
-            'name3'         => (string) ($corrected['lastName']     ?? ''),
-            'name4'         => (string) ($corrected['nameAddition'] ?? ''),
-            'address1'      => (string) ($corrected['street']       ?? ''),
-            'address2'      => (string) ($corrected['houseNumber']  ?? ''),
-            'address3'      => (string) ($corrected['addressLine1'] ?? ''),
-            'address4'      => (string) ($corrected['addressLine2'] ?? ''),
-            'postalCode'    => (string) ($corrected['postalCode']   ?? ''),
-            'town'          => (string) ($corrected['city']         ?? ''),
-            'isPackstation' => !empty($corrected['isPackstation']),
-            'isPostfiliale' => !empty($corrected['isPostfiliale']),
+            'name1'      => (string) ($corrected['company']      ?? ''),
+            'name2'      => (string) ($corrected['firstName']    ?? ''),
+            'name3'      => (string) ($corrected['lastName']     ?? ''),
+            'name4'      => (string) ($corrected['nameAddition'] ?? ''),
+            'address1'   => (string) ($corrected['street']       ?? ''),
+            'address2'   => (string) ($corrected['houseNumber']  ?? ''),
+            'address3'   => (string) ($corrected['addressLine1'] ?? ''),
+            'address4'   => (string) ($corrected['addressLine2'] ?? ''),
+            'postalCode' => (string) ($corrected['postalCode']   ?? ''),
+            'town'       => (string) ($corrected['city']         ?? ''),
         ];
+
+        // Packstation / Postfiliale: `isPackstation` and `isPostfiliale` are NOT
+        // stored fields — Plenty DERIVES them from address1 matching the uppercase
+        // sentinel (Address::PACKSTATION / Address::POSTFILIALE). Verified live
+        // 2026-07-14: the REST address payload carries no such field anywhere, and a
+        // checkout-written Packstation has address1 === "PACKSTATION" exactly. The
+        // cleanup returns a title-cased "Packstation", so writing its street verbatim
+        // silently DEMOTES the address to an ordinary street named "Packstation" with
+        // the station id as its house number — the DHL label then goes out as a street
+        // delivery. Force the sentinel; the branch number stays in address2. (Passing
+        // the two flags in $update was always a no-op and was removed — address1 is
+        // the only switch.)
+        if (!empty($corrected['isPackstation'])) {
+            $update['address1'] = Address::PACKSTATION;
+        } elseif (!empty($corrected['isPostfiliale'])) {
+            $update['address1'] = Address::POSTFILIALE;
+        }
 
         $iso = strtoupper(trim((string) ($corrected['country'] ?? '')));
         if ($iso !== '') {
