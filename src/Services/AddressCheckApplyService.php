@@ -39,6 +39,7 @@ class AddressCheckApplyService
     private CommentRepositoryContract $commentRepo;
     private AuthHelper $authHelper;
     private ConfigRepository $config;
+    private DeliveryOrderGuard $deliveryOrderGuard;
 
     public function __construct(
         PendingAddressCheckRepository $pendingRepo,
@@ -48,16 +49,18 @@ class AddressCheckApplyService
         CountryRepositoryContract $countryRepo,
         CommentRepositoryContract $commentRepo,
         AuthHelper $authHelper,
-        ConfigRepository $config
+        ConfigRepository $config,
+        DeliveryOrderGuard $deliveryOrderGuard
     ) {
-        $this->pendingRepo      = $pendingRepo;
-        $this->orderAddressRepo = $orderAddressRepo;
-        $this->addressRepo      = $addressRepo;
-        $this->orderRepo        = $orderRepo;
-        $this->countryRepo      = $countryRepo;
-        $this->commentRepo      = $commentRepo;
-        $this->authHelper       = $authHelper;
-        $this->config           = $config;
+        $this->pendingRepo        = $pendingRepo;
+        $this->orderAddressRepo   = $orderAddressRepo;
+        $this->addressRepo        = $addressRepo;
+        $this->orderRepo          = $orderRepo;
+        $this->countryRepo        = $countryRepo;
+        $this->commentRepo        = $commentRepo;
+        $this->authHelper         = $authHelper;
+        $this->config             = $config;
+        $this->deliveryOrderGuard = $deliveryOrderGuard;
     }
 
     /**
@@ -653,9 +656,27 @@ class AddressCheckApplyService
 
     /**
      * Soft-fail order-status update. Caller wraps in processUnguarded.
+     *
+     * The delivery-order gate lives here rather than at the three call sites (address
+     * applied, no correction, and writeFailureToOrder) so none of them can forget it, and so
+     * a fourth outcome added later inherits it. It skips the STATUS only: the address and the
+     * internal comment are already written by the time we get here, and both are wanted even
+     * on a Hauptauftrag, because correcting the address was never the harmful half.
+     *
+     * Not mirrored in AddressCheckSubmitService::applyErrorStatus(): that runs only for an
+     * order that already passed skipSubmit(), so the sole gap is a Lieferauftrag created in
+     * the milliseconds between the guard and the submit failure.
      */
     private function updateOrderStatus(int $orderId, float $statusId): void
     {
+        if ($this->deliveryOrderGuard->skipStatusWrite($orderId)) {
+            $this->getLogger(__METHOD__)->info('HeistaAddressCheck::log.statusSkippedHasDeliveryOrders', [
+                'orderId'        => $orderId,
+                'targetStatusId' => $statusId,
+            ]);
+            return;
+        }
+
         $this->orderRepo->updateOrder(['statusId' => $statusId], $orderId);
     }
 

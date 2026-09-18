@@ -127,6 +127,20 @@
         }
       }
     },
+    "orderHandling": {
+      "label": "Config.sectionOrderHandling",
+      "formFields": {
+        "skipSalesOrdersWithDeliveryOrders": {
+          "type": "checkBox",
+          "required": false,
+          "label": "Config.skipSalesOrdersWithDeliveryOrdersLabel",
+          "options": {
+            "tooltip": "Config.skipSalesOrdersWithDeliveryOrdersTooltip",
+            "defaultValue": false
+          }
+        }
+      }
+    },
     "shippingMapping": {
       "label": "Config.sectionShippingMapping",
       "formFields": {

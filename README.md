@@ -62,6 +62,20 @@ unreachable), the cron-poll fallback still applies corrections.
 
 Email source for the DPD check: the delivery address email (`AddressOption::TYPE_EMAIL`), falling back to the order's billing address email.
 
+**Order handling**
+
+- `skipSalesOrdersWithDeliveryOrders` – off by default. Turn it on when the
+  address check runs on the delivery order (Lieferauftrag). A sales order that
+  already has delivery orders is then not checked, and its status is not set, so
+  it stays driven by "lowest status of all delivery orders" and the address is
+  checked once instead of twice. Delivery orders themselves are never affected.
+
+  Leave it off if the sales order is the one that needs the corrected address
+  and the status. The two halves work at different moments: the check is skipped
+  only when the delivery orders already exist at submit time, and when one
+  appears while the check is running, the address and the comment are still
+  written and only the status write is dropped.
+
 **Shipping mapping**
 
 - `dhlProfileIds`, `dpdProfileIds` – comma-separated shipping-profile IDs per

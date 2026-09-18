@@ -34,6 +34,7 @@ class AddressCheckSubmitService
     private PendingAddressCheckRepository $pendingRepo;
     private AuthHelper $authHelper;
     private ConfigRepository $config;
+    private DeliveryOrderGuard $deliveryOrderGuard;
 
     public function __construct(
         SaasClient $saasClient,
@@ -43,16 +44,18 @@ class AddressCheckSubmitService
         CountryRepositoryContract $countryRepo,
         PendingAddressCheckRepository $pendingRepo,
         AuthHelper $authHelper,
-        ConfigRepository $config
+        ConfigRepository $config,
+        DeliveryOrderGuard $deliveryOrderGuard
     ) {
-        $this->saasClient       = $saasClient;
-        $this->orderAddressRepo = $orderAddressRepo;
-        $this->addressRepo      = $addressRepo;
-        $this->orderRepo        = $orderRepo;
-        $this->countryRepo      = $countryRepo;
-        $this->pendingRepo      = $pendingRepo;
-        $this->authHelper       = $authHelper;
-        $this->config           = $config;
+        $this->saasClient         = $saasClient;
+        $this->orderAddressRepo   = $orderAddressRepo;
+        $this->addressRepo        = $addressRepo;
+        $this->orderRepo          = $orderRepo;
+        $this->countryRepo        = $countryRepo;
+        $this->pendingRepo        = $pendingRepo;
+        $this->authHelper         = $authHelper;
+        $this->config             = $config;
+        $this->deliveryOrderGuard = $deliveryOrderGuard;
     }
 
     public function submitForOrder(Order $order): void
@@ -64,6 +67,16 @@ class AddressCheckSubmitService
 
         if ($apiKey === '') {
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.missingConfig', ['orderId' => $orderId]);
+            return;
+        }
+
+        // Opt-in: a Hauptauftrag that already has Lieferaufträge is not checked, because the
+        // Lieferauftrag is what ships and the Hauptauftrag's status is derived from it. Sits
+        // before everything that costs money. Off by default, see DeliveryOrderGuard.
+        if ($this->deliveryOrderGuard->skipSubmit($order)) {
+            $this->getLogger(__METHOD__)->info('HeistaAddressCheck::log.skippedHasDeliveryOrders', [
+                'orderId' => $orderId,
+            ]);
             return;
         }
 
@@ -216,6 +229,13 @@ class AddressCheckSubmitService
             'serviceKey'     => 'address_check',
             'callbackUrl'    => $callbackUrl,
             'callbackSecret' => $callbackSecret,
+            // The Plenty order id, so a job can be traced back to its order from our side.
+            // Without it the only way to match a job to an order is by timestamp against the
+            // merchant's own order history, which is how the 2026-09-18 double-submit report
+            // had to be answered. Stored as `jobs.external_ref` and echoed back in the
+            // callback body; the platform gives it no other meaning (no uniqueness, no
+            // deduplication), so sending it changes nothing else.
+            'externalRef'    => (string) $orderId,
             'items'          => [$item],
         ];
 
