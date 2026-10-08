@@ -119,20 +119,20 @@ class AddressCheckApplyService
         // passed down rather than unpacked into one parameter per field, so a new contract
         // field only touches formatResultComment().
 
-        // Resolve the configured target status for this outcome up front,
-        // whether or not we apply the address. Empty/non-numeric is skipped.
-        $targetStatusId = $this->resolveTargetStatusId($outputStatus);
-
         // Apply the correction whenever the result is valid and a structured
         // corrected payload came back. Covers 'verified', 'corrected' and
         // 'review_suggested' (cleaned, but flagged for a human). We still
         // set the configured status and keep the original address as an internal
         // comment so the merchant can revert a bad correction.
+        //
+        // The target status is decided inside each branch, after the phone write: a phone the
+        // label would be refused for overrides an outcome that would otherwise let the order
+        // through (see statusBucket()), and a correction that failed to save counts as one.
         $shouldApplyAddress = $isValid && is_array($corrected);
 
         if ($shouldApplyAddress) {
             try {
-                $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $output, $jobId, $targetStatusId): void {
+                $targetStatusId = $this->authHelper->processUnguarded(function () use ($row, $corrected, $input, $orderId, $output, $jobId, $outputStatus) {
                     $update = $this->mapCorrectedToPlentyFields($corrected);
                     $this->orderAddressRepo->updateOrderAddress(
                         $update,
@@ -146,6 +146,10 @@ class AddressCheckApplyService
                     // soft-fail — the address is already saved.
                     $this->applyPostNumber((int) $row->deliveryAddressId, $corrected, $update);
 
+                    // After the address write, because updateOrderAddress forks a shared
+                    // address and the phone must land on the record the order now points at.
+                    $output['phoneApplied'] = $this->applyPhone($orderId, $output);
+
                     // Always leave an internal note with the outcome + next step (the
                     // original address doubles as a revert reference) — 'verified'
                     // included: every order must show that the check ran and what it
@@ -157,9 +161,12 @@ class AddressCheckApplyService
                     // Status update in the same processUnguarded to avoid
                     // re-auth. Address is already saved, so a bad statusId
                     // shouldn't roll it back.
+                    $targetStatusId = $this->resolveTargetStatusId($this->statusBucket($outputStatus, $output));
                     if ($targetStatusId !== null) {
                         $this->updateOrderStatus($orderId, $targetStatusId);
                     }
+
+                    return $targetStatusId;
                 });
             } catch (Throwable $e) {
                 $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.applyFailed', [
@@ -181,6 +188,7 @@ class AddressCheckApplyService
                 'orderId'         => $orderId,
                 'outputStatus'    => $outputStatus,
                 'outputReason'    => (string) ($output['reason'] ?? ''),
+                'phoneStatus'     => (string) ($output['phoneStatus'] ?? ''),
                 'creditsConsumed' => (int)    ($output['creditsConsumed'] ?? 0),
                 'targetStatusId'  => $targetStatusId,
             ]);
@@ -193,10 +201,15 @@ class AddressCheckApplyService
         // Heista found (on address_conflict that note carries the suggested address) and the
         // recommended next step, and set the configured status so the merchant can route it to
         // a review queue. Row is marked FAILED to reflect that the address wasn't applied.
+        // The phone is still fixed here: an undeliverable address does not make a refused
+        // label any less refused, and the merchant fixes both in one pass.
         try {
-            $this->authHelper->processUnguarded(function () use ($orderId, $targetStatusId, $input, $output, $jobId): void {
+            $this->authHelper->processUnguarded(function () use ($orderId, $input, $output, $jobId, $outputStatus): void {
+                $output['phoneApplied'] = $this->applyPhone($orderId, $output);
+
                 $this->tryPostResultComment($orderId, $input, $output, false, $jobId);
 
+                $targetStatusId = $this->resolveTargetStatusId($this->statusBucket($outputStatus, $output));
                 if ($targetStatusId !== null) {
                     $this->updateOrderStatus($orderId, $targetStatusId);
                 }
@@ -205,7 +218,7 @@ class AddressCheckApplyService
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.statusUpdateFailed', [
                 'jobId'          => $jobId,
                 'orderId'        => $orderId,
-                'targetStatusId' => $targetStatusId,
+                'targetStatusId' => null,
                 'outputStatus'   => $outputStatus,
                 'error'          => $e->getMessage(),
             ]);
@@ -426,9 +439,20 @@ class AddressCheckApplyService
             $snapshotLabel = 'Originaladresse vor Korrektur';
         }
 
+        // When the phone is what stops an order the address alone would have let through, the
+        // next step has to say so, or the note reads "Keine Aktion nötig" on an order that was
+        // just moved to the error status.
+        $nextStep = $this->nextStepText($outputStatus, $outputReason);
+        if ($this->statusBucket($outputStatus, $output) !== $outputStatus) {
+            $phoneStep = 'Telefonnummer in der Lieferadresse korrigieren, sonst lehnt DHL das Versandlabel ab. Details unten.';
+            $nextStep  = $outputStatus === 'review_suggested' ? $phoneStep . ' Zur Adresse: ' . $nextStep : $phoneStep;
+        }
+
         $body  = '<p><strong>Heista Adressprüfung</strong><br>';
         $body .= 'Ergebnis: ' . htmlspecialchars($this->statusLabel($outputStatus, $outputReason), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '<br>';
-        $body .= 'Nächster Schritt: ' . htmlspecialchars($this->nextStepText($outputStatus, $outputReason), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+        $body .= 'Nächster Schritt: ' . htmlspecialchars($nextStep, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+
+        $body .= $this->formatPhoneBlock($input, $output);
 
         // DHL's verbatim validation lines. For a dhl_only merchant this is the entire
         // explanation of the verdict — nothing else ran on that path.
@@ -492,6 +516,48 @@ class AddressCheckApplyService
         $body .= '<p><em>Job-ID: ' . htmlspecialchars($jobId, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</em></p>';
 
         return $body;
+    }
+
+    /**
+     * Returns the "Telefonnummer" paragraph for the order comment, or '' when the phone was not
+     * checked or DHL accepts it as written. A valid phone gets no line: nothing happened to it.
+     */
+    private function formatPhoneBlock(array $input, array $output): string
+    {
+        $phoneStatus = (string) ($output['phoneStatus'] ?? '');
+        $original    = htmlspecialchars(trim((string) ($input['phone'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $corrected   = htmlspecialchars(trim((string) ($output['phoneCorrected'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        if ($phoneStatus === 'corrected' && !empty($output['phoneApplied'])) {
+            return '<p><strong>Telefonnummer korrigiert:</strong> ' . $original . ' wurde zu ' . $corrected . '<br>'
+                 . '<em>In der Lieferadresse gespeichert. In der alten Schreibweise hätte DHL das Versandlabel abgelehnt.</em></p>';
+        }
+
+        if ($phoneStatus === 'corrected') {
+            return '<p><strong>Telefonnummer nicht gespeichert:</strong> ' . $original . '<br>'
+                 . 'Vorschlag: ' . $corrected . '. Die Korrektur ließ sich nicht in der Lieferadresse speichern, '
+                 . 'bitte von Hand eintragen. In der jetzigen Schreibweise lehnt DHL das Versandlabel ab.</p>';
+        }
+
+        if ($phoneStatus === 'invalid') {
+            switch ((string) ($output['phoneReason'] ?? '')) {
+                case 'phone_invalid_characters':
+                    $why = 'Sie enthält Buchstaben oder Zeichen, die DHL nicht annimmt, etwa eine Durchwahl, einen Zusatz wie „Tel.“ oder zwei Nummern in einem Feld.';
+                    break;
+                case 'phone_too_long':
+                    $why = 'Sie hat mehr als 20 Ziffern, vermutlich stehen zwei Nummern in einem Feld.';
+                    break;
+                default:
+                    $why = 'DHL nimmt sie in dieser Form nicht an.';
+            }
+
+            return '<p><strong>Telefonnummer ungültig:</strong> ' . $original . '<br>'
+                 . htmlspecialchars($why, ENT_QUOTES | ENT_HTML5, 'UTF-8')
+                 . ' Die Nummer wurde nicht verändert, weil eine automatische Korrektur raten müsste. '
+                 . 'Bitte in der Lieferadresse korrigieren, sonst lehnt DHL das Versandlabel ab.</p>';
+        }
+
+        return '';
     }
 
     /**
@@ -779,6 +845,139 @@ class AddressCheckApplyService
                 'validationDetails' => $validationDetails,
             ]);
         }
+    }
+
+    /**
+     * Outcomes that would let the order continue to shipping. A phone the label would be
+     * refused for stops exactly these; every other outcome already lands in a status a
+     * human works through, and the comment names the phone problem there too.
+     */
+    private const OUTCOMES_THAT_SHIP = ['verified', 'corrected', 'review_suggested'];
+
+    /**
+     * Returns the outcome whose configured status the order gets: 'error' when the phone
+     * needs a human and the address alone would have let the order ship, else the address
+     * outcome unchanged.
+     */
+    private function statusBucket(string $outputStatus, array $output): string
+    {
+        if ($this->phoneNeedsHuman($output) && in_array($outputStatus, self::OUTCOMES_THAT_SHIP, true)) {
+            return 'error';
+        }
+
+        return $outputStatus;
+    }
+
+    /**
+     * True when the label would still be refused for the phone: the check found no safe fix,
+     * or found one that could not be saved. `phoneApplied` is set by apply() after applyPhone().
+     */
+    private function phoneNeedsHuman(array $output): bool
+    {
+        $phoneStatus = (string) ($output['phoneStatus'] ?? '');
+
+        return $phoneStatus === 'invalid'
+            || ($phoneStatus === 'corrected' && empty($output['phoneApplied']));
+    }
+
+    /**
+     * Writes the corrected phone to the order's delivery address (AddressOption type 4) and
+     * returns whether it was saved. Caller wraps this in processUnguarded.
+     *
+     * Always the delivery address, whichever record the phone was read from at submit: the
+     * contact is master data shared by every order of that customer, and the billing address
+     * prints on invoices. The delivery address is the one the label is built from.
+     *
+     * Reads the order's CURRENT delivery address rather than the id recorded at submit,
+     * because updateOrderAddress forks a shared address and relinks the order to the copy.
+     * Same upsert as applyPostNumber(): a full address payload carrying an `options` key.
+     * Soft-fail: a false return sends the order to the error status instead.
+     */
+    private function applyPhone(int $orderId, array $output): bool
+    {
+        if ((string) ($output['phoneStatus'] ?? '') !== 'corrected') {
+            return false;
+        }
+
+        // The platform returns digits only, at most 20 (DHL's limit). Anything else is not
+        // written; the order then goes to the error status and the comment shows the value.
+        $phone = trim((string) ($output['phoneCorrected'] ?? ''));
+        if (preg_match('/^[0-9]{1,20}$/', $phone) !== 1) {
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.phoneRejected', [
+                'orderId' => $orderId,
+                'phone'   => $phone,
+            ]);
+            return false;
+        }
+
+        try {
+            $address = $this->orderAddressRepo->findAddressByType($orderId, AddressRelationType::DELIVERY_ADDRESS);
+            $addressId = (int) ($address->id ?? 0);
+            if ($addressId <= 0) {
+                return false;
+            }
+
+            $payload            = $this->currentAddressFields($address);
+            $payload['options'] = [[
+                'typeId' => AddressOption::TYPE_TELEPHONE,
+                'value'  => $phone,
+            ]];
+
+            $this->addressRepo->updateAddress($payload, $addressId);
+
+            $this->report(__METHOD__, 'HeistaAddressCheck::log.phoneApplied', [
+                'orderId'   => $orderId,
+                'addressId' => $addressId,
+            ]);
+            return true;
+        } catch (Throwable $e) {
+            $validationDetails = '';
+            if ($e instanceof ValidationException) {
+                try {
+                    $bag = $e->getMessageBag();
+                    $validationDetails = is_object($bag)
+                        ? (string) json_encode($bag->toArray(), JSON_UNESCAPED_UNICODE)
+                        : '';
+                } catch (Throwable $inner) {
+                    $validationDetails = 'unreadable: ' . $inner->getMessage();
+                }
+            }
+
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.phoneFailed', [
+                'orderId'           => $orderId,
+                'error'             => $e->getMessage(),
+                'class'             => get_class($e),
+                'validationDetails' => $validationDetails,
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * The address's own values in the numbered-column shape mapCorrectedToPlentyFields()
+     * writes, so an option upsert re-sends the address unchanged.
+     */
+    private function currentAddressFields(Address $address): array
+    {
+        $fields = [
+            'name1'      => (string) ($address->name1 ?? ''),
+            'name2'      => (string) ($address->name2 ?? ''),
+            'name3'      => (string) ($address->name3 ?? ''),
+            'name4'      => (string) ($address->name4 ?? ''),
+            'address1'   => (string) ($address->address1 ?? ''),
+            'address2'   => (string) ($address->address2 ?? ''),
+            'address3'   => (string) ($address->address3 ?? ''),
+            'address4'   => (string) ($address->address4 ?? ''),
+            'postalCode' => (string) ($address->postalCode ?? ''),
+            'town'       => (string) ($address->town ?? ''),
+        ];
+
+        $countryId = (int) ($address->countryId ?? 0);
+        if ($countryId > 0) {
+            $fields['countryId'] = $countryId;
+        }
+
+        return $fields;
     }
 
     private function mapCorrectedToPlentyFields(array $corrected): array

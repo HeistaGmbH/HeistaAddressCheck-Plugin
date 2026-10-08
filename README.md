@@ -59,8 +59,32 @@ unreachable), the cron-poll fallback still applies corrections.
 | `postnumber_invalid` | no | Packstation/Postfiliale post number invalid | request a valid post number |
 | `email_required` | no | Carrier needs an email and none is present (e.g. DPD) | request an email from the customer |
 | `error` | no | Check failed (no result / timeout) | retry — not the customer's fault |
+| `error` (phone) | yes | The address passed, but DHL would refuse the label for the phone number (see below) | fix the phone number in the delivery address |
 
 Email source for the DPD check: the delivery address email (`AddressOption::TYPE_EMAIL`), falling back to the order's billing address email.
+
+**Phone number (DHL only, since 1.7.0)**
+
+DHL refuses a shipping label when the recipient phone contains letters or
+symbols such as `*` or `#`, or runs past 20 characters. For orders whose
+shipping profile is listed in `dhlProfileIds`, the plugin sends the phone along
+and Heista checks it against that rule. Orders on any other or unmapped profile
+are not checked.
+
+- Source: the delivery address phone (`AddressOption::TYPE_TELEPHONE`), else the
+  billing address phone, else the receiving contact's phone.
+- A number DHL accepts as written is left alone.
+- A number DHL would refuse but that can be fixed safely is rewritten as digits
+  only: separators and stray `*` dropped, a leading `+` written as `00`, `(0)`
+  after the country code removed. It is written to the **delivery address**,
+  whichever record it came from, and the order comment shows the old and the
+  new value.
+- A number that cannot be fixed without guessing (an extension, `Tel.`, two
+  numbers in one field) is left unchanged. The order goes to `statusOnError`
+  when the address result would otherwise have let it ship (`verified`,
+  `corrected`, `review_suggested`). Other outcomes keep their own status, and
+  the comment names the phone problem either way.
+- The phone has no effect on the address result or on what the check costs.
 
 **Order handling**
 

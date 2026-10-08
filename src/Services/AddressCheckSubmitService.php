@@ -9,11 +9,14 @@ use Plenty\Modules\Account\Address\Contracts\AddressRepositoryContract;
 use Plenty\Modules\Account\Address\Models\Address;
 use Plenty\Modules\Account\Address\Models\AddressOption;
 use Plenty\Modules\Account\Address\Models\AddressRelationType;
+use Plenty\Modules\Account\Contact\Contracts\ContactRepositoryContract;
+use Plenty\Modules\Account\Contact\Models\ContactOption;
 use Plenty\Modules\Authorization\Services\AuthHelper;
 use Plenty\Modules\Order\Address\Contracts\OrderAddressRepositoryContract;
 use Plenty\Modules\Order\Contracts\OrderRepositoryContract;
 use Plenty\Modules\Order\Models\Order;
 use Plenty\Modules\Order\Property\Models\OrderPropertyType;
+use Plenty\Modules\Order\RelationReference\Models\OrderRelationReference;
 use Plenty\Modules\Order\Shipping\Countries\Contracts\CountryRepositoryContract;
 use Plenty\Plugin\Application;
 use Plenty\Plugin\ConfigRepository;
@@ -35,6 +38,7 @@ class AddressCheckSubmitService
     private AuthHelper $authHelper;
     private ConfigRepository $config;
     private DeliveryOrderGuard $deliveryOrderGuard;
+    private ContactRepositoryContract $contactRepo;
 
     public function __construct(
         SaasClient $saasClient,
@@ -45,7 +49,8 @@ class AddressCheckSubmitService
         PendingAddressCheckRepository $pendingRepo,
         AuthHelper $authHelper,
         ConfigRepository $config,
-        DeliveryOrderGuard $deliveryOrderGuard
+        DeliveryOrderGuard $deliveryOrderGuard,
+        ContactRepositoryContract $contactRepo
     ) {
         $this->saasClient         = $saasClient;
         $this->orderAddressRepo   = $orderAddressRepo;
@@ -56,6 +61,7 @@ class AddressCheckSubmitService
         $this->authHelper         = $authHelper;
         $this->config             = $config;
         $this->deliveryOrderGuard = $deliveryOrderGuard;
+        $this->contactRepo        = $contactRepo;
     }
 
     public function submitForOrder(Order $order): void
@@ -121,13 +127,16 @@ class AddressCheckSubmitService
         // Delivery address first, order billing address as fallback.
         $email = $this->resolveEmail($orderId, $address);
 
+        // Checked against DHL's phone rule by the platform, so a label is not refused for it.
+        $phone = $this->resolvePhone($order, $address);
+
         $callbackUrl = $this->buildCallbackUrl();
         $this->getLogger(__METHOD__)->debug('HeistaAddressCheck::log.callbackUrlResolved', [
             'orderId'     => $orderId,
             'plentyId'    => (int) pluginApp(Application::class)->getPlentyId(),
             'callbackUrl' => $callbackUrl,
         ]);
-        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $endpointOverride, $shippingProvider, $email);
+        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $endpointOverride, $shippingProvider, $email, $phone);
 
         try {
             $jobId = $this->saasClient->submitJob($apiBaseUrl, $apiKey, $payload);
@@ -185,7 +194,7 @@ class AddressCheckSubmitService
         return 'https://p' . $plentyId . '.my.plentysystems.com/rest/heista/address-check/callback';
     }
 
-    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $endpointOverride = '', string $shippingProvider = '', string $email = ''): array
+    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $endpointOverride = '', string $shippingProvider = '', string $email = '', string $phone = ''): array
     {
         $countryIso = '';
         if (!empty($address->countryId)) {
@@ -224,6 +233,11 @@ class AddressCheckSubmitService
             // unmapped. Must match the provider keys the backend expects.
             'shippingProvider' => $shippingProvider,
         ];
+
+        // Only sent when there is one: no phone means nothing to check, and nothing to hand over.
+        if ($phone !== '') {
+            $item['phone'] = $phone;
+        }
 
         $payload = [
             'serviceKey'     => 'address_check',
@@ -336,6 +350,137 @@ class AddressCheckSubmitService
         } catch (Throwable $e) {
             return '';
         }
+    }
+
+    /**
+     * Returns the recipient's phone: the delivery address (AddressOption type 4), else the
+     * billing address, else the receiving contact. That is the order the merchant expects
+     * Plenty's DHL integration to read it in; which one the label really uses is not verified
+     * yet, so the debug line names the source that answered. '' when none has one.
+     */
+    private function resolvePhone(Order $order, Address $deliveryAddress): string
+    {
+        $orderId = (int) $order->id;
+
+        $source = 'delivery';
+        $phone  = trim((string) ($deliveryAddress->phone ?? ''));
+        if ($phone === '') {
+            $source = 'billing';
+            $phone  = $this->billingAddressPhone($orderId);
+        }
+        if ($phone === '') {
+            $source = 'contact';
+            $phone  = $this->contactPhone($this->receiverContactId($order));
+        }
+        if ($phone === '') {
+            $source = 'none';
+        }
+
+        $this->getLogger(__METHOD__)->debug('HeistaAddressCheck::log.phoneSourceResolved', [
+            'orderId' => $orderId,
+            'source'  => $source,
+        ]);
+
+        return $phone;
+    }
+
+    private function billingAddressPhone(int $orderId): string
+    {
+        try {
+            $billing = $this->orderAddressRepo->findAddressByType($orderId, AddressRelationType::BILLING_ADDRESS);
+            return trim((string) ($billing->phone ?? ''));
+        } catch (Throwable $e) {
+            return '';
+        }
+    }
+
+    /**
+     * The receiving contact's id: `contactReceiverId` when the order model carries it, else
+     * the receiver relation. 0 for a guest order without a contact.
+     */
+    private function receiverContactId(Order $order): int
+    {
+        $direct = (int) ($order->contactReceiverId ?? 0);
+        if ($direct > 0) {
+            return $direct;
+        }
+
+        foreach (($order->relations ?? []) as $relation) {
+            if (is_object($relation)) {
+                $type = $relation->referenceType ?? '';
+                $role = $relation->relation ?? '';
+                $id   = $relation->referenceId ?? 0;
+            } elseif (is_array($relation)) {
+                $type = $relation['referenceType'] ?? '';
+                $role = $relation['relation'] ?? '';
+                $id   = $relation['referenceId'] ?? 0;
+            } else {
+                continue;
+            }
+
+            if ($type === OrderRelationReference::REFERENCE_TYPE_CONTACT
+                && $role === OrderRelationReference::RELATION_TYPE_RECEIVER
+                && (int) $id > 0) {
+                return (int) $id;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * The contact's private phone, else private mobile, else any other phone option.
+     * Soft-fail: a contact we cannot read means no phone, never a failed submit.
+     */
+    private function contactPhone(int $contactId): string
+    {
+        if ($contactId <= 0) {
+            return '';
+        }
+
+        try {
+            $contact = $this->authHelper->processUnguarded(function () use ($contactId) {
+                return $this->contactRepo->findContactById($contactId);
+            });
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.contactLookupFailed', [
+                'contactId' => $contactId,
+                'error'     => $e->getMessage(),
+            ]);
+            return '';
+        }
+
+        if (!is_object($contact)) {
+            return '';
+        }
+
+        foreach ([$contact->privatePhone ?? '', $contact->privateMobile ?? ''] as $candidate) {
+            $value = trim((string) $candidate);
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        foreach (($contact->options ?? []) as $option) {
+            if (is_object($option)) {
+                $typeId = $option->typeId ?? null;
+                $value  = $option->value ?? '';
+            } elseif (is_array($option)) {
+                $typeId = $option['typeId'] ?? null;
+                $value  = $option['value'] ?? '';
+            } else {
+                continue;
+            }
+
+            if ((int) $typeId === ContactOption::TYPE_PHONE) {
+                $value = trim((string) $value);
+                if ($value !== '') {
+                    return $value;
+                }
+            }
+        }
+
+        return '';
     }
 
     /**
