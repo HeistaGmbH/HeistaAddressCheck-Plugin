@@ -74,13 +74,17 @@ are not checked.
 - Source: the delivery address phone (`AddressOption::TYPE_TELEPHONE`), else the
   billing address phone, else the receiving contact's phone.
 - A number DHL accepts as written is left alone.
-- A number DHL would refuse but that can be fixed safely is rewritten as digits
-  only: separators and stray `*` dropped, a leading `+` written as `00`, `(0)`
-  after the country code removed. It is written to the **delivery address**,
-  whichever record it came from, and the order comment shows the old and the
-  new value.
-- A number that cannot be fixed without guessing (an extension, `Tel.`, two
-  numbers in one field) is left unchanged. The order goes to `statusOnError`
+- Whether Heista repairs a number DHL would refuse depends on the booked check
+  model. With DHL validation only, the number is flagged and never changed, so
+  it is fixed by hand. The models that include Heista's own correction repair it
+  where that is safe.
+- A repaired number is rewritten as digits only: separators and stray `*`
+  dropped, a leading `+` written as `00`, `(0)` after the country code removed.
+  It is written to the **delivery address**, whichever record it came from, and
+  the order comment shows the old and the new value.
+- A number that is not repaired (the model does not repair, or fixing it would
+  mean guessing: an extension, `Tel.`, two numbers in one field) is left
+  unchanged. The order goes to `statusOnError`
   when the address result would otherwise have let it ship (`verified`,
   `corrected`, `review_suggested`). Other outcomes keep their own status, and
   the comment names the phone problem either way.

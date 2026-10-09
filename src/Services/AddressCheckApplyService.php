@@ -541,11 +541,13 @@ class AddressCheckApplyService
 
         if ($phoneStatus === 'invalid') {
             switch ((string) ($output['phoneReason'] ?? '')) {
+                // Describes only what is wrong with the number. Whether Heista would have repaired
+                // it depends on the booked check model, which the plugin does not know.
                 case 'phone_invalid_characters':
-                    $why = 'Sie enthält Buchstaben oder Zeichen, die DHL nicht annimmt, etwa eine Durchwahl, einen Zusatz wie „Tel.“ oder zwei Nummern in einem Feld.';
+                    $why = 'Sie enthält Buchstaben oder Zeichen, die DHL nicht annimmt, etwa *, #, eine Durchwahl oder einen Zusatz wie „Tel.“.';
                     break;
                 case 'phone_too_long':
-                    $why = 'Sie hat mehr als 20 Ziffern, vermutlich stehen zwei Nummern in einem Feld.';
+                    $why = 'Sie ist länger als die 20 Zeichen, die DHL annimmt. Oft stehen zwei Nummern in einem Feld.';
                     break;
                 default:
                     $why = 'DHL nimmt sie in dieser Form nicht an.';
@@ -553,7 +555,7 @@ class AddressCheckApplyService
 
             return '<p><strong>Telefonnummer ungültig:</strong> ' . $original . '<br>'
                  . htmlspecialchars($why, ENT_QUOTES | ENT_HTML5, 'UTF-8')
-                 . ' Die Nummer wurde nicht verändert, weil eine automatische Korrektur raten müsste. '
+                 . ' Die Nummer wurde nicht automatisch geändert. '
                  . 'Bitte in der Lieferadresse korrigieren, sonst lehnt DHL das Versandlabel ab.</p>';
         }
 
