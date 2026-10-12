@@ -143,8 +143,9 @@ class AddressCheckApplyService
 
                     // The Postnummer lives in an AddressOption, not in an address
                     // column, so updateOrderAddress cannot reach it. Separate write,
-                    // soft-fail — the address is already saved.
-                    $this->applyPostNumber((int) $row->deliveryAddressId, $corrected, $update);
+                    // soft-fail — the address is already saved. Takes the order id, not
+                    // $row->deliveryAddressId: after a fork that id is the old record.
+                    $this->applyPostNumber($orderId, $corrected);
 
                     // After the address write, because updateOrderAddress forks a shared
                     // address and the phone must land on the record the order now points at.
@@ -758,6 +759,13 @@ class AddressCheckApplyService
      * record. The two hold different values on the same address — verified live
      * (2026-07-14). `updateOrderAddress` cannot reach the options, hence this second write.
      *
+     * **Which address.** The order's CURRENT delivery address, read after the address
+     * write. `updateOrderAddress` forks an address the order shares with its billing
+     * address: it creates a new record for the correction and relinks the order to it.
+     * Writing to the id recorded at submit then puts the Postnummer on the old record,
+     * which is still the billing address, and the delivery address the label is built
+     * from has none (verified live on a test system, 1.7.0). Same re-read as applyPhone().
+     *
      * **How the option is written — and why NOT with the *Options methods.**
      * `createAddressOptions()` / `updateAddressOptions()` look like the obvious contracts,
      * but their `array $addressData` shape is undocumented; a first attempt at
@@ -766,8 +774,8 @@ class AddressCheckApplyService
      * Plenty does not surface — it now logs at `error`). What IS proven against the live
      * REST address endpoint — which is backed by this same repository — is that a **full
      * address payload carrying an `options` key upserts that option in place**, leaving the
-     * address's other options untouched. So we pass the address fields we just wrote, plus
-     * the option. Idempotent: it creates the option when absent and overwrites it when
+     * address's other options untouched. So we re-send the address's own current fields,
+     * plus the option. Idempotent: it creates the option when absent and overwrites it when
      * present, so no lookup and no create/update branch is needed (`(addressId, typeId)` is
      * UNIQUE, so a blind create WOULD fail on a duplicate).
      *
@@ -778,15 +786,11 @@ class AddressCheckApplyService
      *
      * Soft-fail: the address itself is already saved and must not be rolled back over a
      * post-number problem.
-     *
-     * @param array $addressUpdate The mapped address fields just written by the caller.
-     *                             Re-sent here because the option upsert rides along with a
-     *                             full, valid address payload.
      */
-    private function applyPostNumber(int $addressId, array $corrected, array $addressUpdate): void
+    private function applyPostNumber(int $orderId, array $corrected): void
     {
         $isSpecial = !empty($corrected['isPackstation']) || !empty($corrected['isPostfiliale']);
-        if (!$isSpecial || $addressId <= 0) {
+        if (!$isSpecial) {
             return;
         }
 
@@ -803,14 +807,25 @@ class AddressCheckApplyService
         // (3-4 digits), which is a different field entirely.
         if (preg_match('/^[0-9]{6,10}$/', $postNumber) !== 1) {
             $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.postNumberRejected', [
-                'addressId'  => $addressId,
+                'orderId'    => $orderId,
                 'postNumber' => $postNumber,
             ]);
             return;
         }
 
+        $addressId = 0;
         try {
-            $payload            = $addressUpdate;
+            $address   = $this->orderAddressRepo->findAddressByType($orderId, AddressRelationType::DELIVERY_ADDRESS);
+            $addressId = (int) ($address->id ?? 0);
+            if ($addressId <= 0) {
+                $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.postNumberFailed', [
+                    'orderId' => $orderId,
+                    'error'   => 'order has no delivery address after the address write',
+                ]);
+                return;
+            }
+
+            $payload            = $this->currentAddressFields($address);
             $payload['options'] = [[
                 'typeId' => AddressOption::TYPE_POST_NUMBER,
                 'value'  => $postNumber,
@@ -819,6 +834,7 @@ class AddressCheckApplyService
             $this->addressRepo->updateAddress($payload, $addressId);
 
             $this->report(__METHOD__, 'HeistaAddressCheck::log.postNumberApplied', [
+                'orderId'   => $orderId,
                 'addressId' => $addressId,
             ]);
         } catch (Throwable $e) {
@@ -841,6 +857,7 @@ class AddressCheckApplyService
             }
 
             $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.postNumberFailed', [
+                'orderId'           => $orderId,
                 'addressId'         => $addressId,
                 'error'             => $e->getMessage(),
                 'class'             => get_class($e),
