@@ -229,6 +229,21 @@ class AddressCheckApplyService
     }
 
     /**
+     * A submit that will never produce a verdict: refused by the platform, or
+     * unreachable for the whole retry window. Same note and status write as a
+     * job without a verdict, so the merchant meets one shape of failure. Public
+     * for AddressCheckSubmitService, which has no comment code of its own; before
+     * 1.8.0 it set the status and wrote nothing, and a merchant could not tell
+     * an unchecked order from a bad address.
+     *
+     * @param array $input the submitted item, so the note carries the address snapshot
+     */
+    public function writeSubmitFailure(int $orderId, array $input, string $failureDetail): void
+    {
+        $this->writeFailureToOrder($orderId, '', $input, $failureDetail);
+    }
+
+    /**
      * A job that never produced a verdict (job status != COMPLETED, or an item with no
      * output payload). The address is left untouched — a backend failure must never
      * rewrite a customer's address — but the order still gets an internal note and the
@@ -514,7 +529,11 @@ class AddressCheckApplyService
             $body .= implode('<br>', $rows) . '</p>';
         }
 
-        $body .= '<p><em>Job-ID: ' . htmlspecialchars($jobId, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</em></p>';
+        // A submit that never reached the platform has no job, and an empty id line
+        // would read as a bug.
+        if ($jobId !== '') {
+            $body .= '<p><em>Job-ID: ' . htmlspecialchars($jobId, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</em></p>';
+        }
 
         return $body;
     }
@@ -732,9 +751,9 @@ class AddressCheckApplyService
      * internal comment are already written by the time we get here, and both are wanted even
      * on a Hauptauftrag, because correcting the address was never the harmful half.
      *
-     * Not mirrored in AddressCheckSubmitService::applyErrorStatus(): that runs only for an
-     * order that already passed skipSubmit(), so the sole gap is a Lieferauftrag created in
-     * the milliseconds between the guard and the submit failure.
+     * Since 1.8.0 the submit path's failures also come through here (writeSubmitFailure), so
+     * the gate covers them too. A resubmit from the retry queue may run hours after the
+     * original event, which is exactly when a Lieferauftrag is likely to exist by now.
      */
     private function updateOrderStatus(int $orderId, float $statusId): void
     {

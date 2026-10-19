@@ -39,6 +39,20 @@ class AddressCheckSubmitService
     private ConfigRepository $config;
     private DeliveryOrderGuard $deliveryOrderGuard;
     private ContactRepositoryContract $contactRepo;
+    private AddressCheckApplyService $apply;
+
+    /**
+     * Retry cadence for a submit that could not reach the platform (1.8.0).
+     * The first retry comes with the next cron tick (5 minutes), then the gap
+     * doubles up to an hour, and a Retry-After from the platform overrides the
+     * gap. After RETRY_WINDOW_SECONDS since the first attempt the plugin stops
+     * and tells the merchant, so no order waits forever without anyone knowing.
+     * 24 hours covers a platform-side interruption of several hours with room
+     * to spare; a weekend one may take longer, and then the note says so.
+     */
+    private const RETRY_WINDOW_SECONDS     = 24 * 3600;
+    private const RETRY_BASE_DELAY_SECONDS = 300;
+    private const RETRY_MAX_DELAY_SECONDS  = 3600;
 
     public function __construct(
         SaasClient $saasClient,
@@ -50,7 +64,8 @@ class AddressCheckSubmitService
         AuthHelper $authHelper,
         ConfigRepository $config,
         DeliveryOrderGuard $deliveryOrderGuard,
-        ContactRepositoryContract $contactRepo
+        ContactRepositoryContract $contactRepo,
+        AddressCheckApplyService $apply
     ) {
         $this->saasClient         = $saasClient;
         $this->orderAddressRepo   = $orderAddressRepo;
@@ -62,9 +77,60 @@ class AddressCheckSubmitService
         $this->config             = $config;
         $this->deliveryOrderGuard = $deliveryOrderGuard;
         $this->contactRepo        = $contactRepo;
+        $this->apply              = $apply;
     }
 
+    /**
+     * Entry point of the event procedure. An order that already sits in the
+     * retry queue (the merchant re-ran the action by hand) is attempted now on
+     * its existing row instead of getting a second one that would submit the
+     * same address twice later.
+     */
     public function submitForOrder(Order $order): void
+    {
+        $this->attempt($order, $this->pendingRepo->findRetryByOrderId((int) $order->id));
+    }
+
+    /**
+     * Entry point of FallbackPollCron for a RETRY row whose nextAttemptAt has
+     * passed. Loads the order itself; the event that carried it is long gone.
+     * A row whose order cannot be loaded is closed without a status write: there
+     * is no order to write to.
+     */
+    public function resubmit(PendingAddressCheck $row): void
+    {
+        $orderId   = (int) $row->orderId;
+        $loadError = '';
+
+        try {
+            $order = $this->authHelper->processUnguarded(function () use ($orderId) {
+                return $this->orderRepo->findOrderById($orderId);
+            });
+        } catch (Throwable $e) {
+            $order     = null;
+            $loadError = $e->getMessage();
+        }
+
+        if (!$order instanceof Order) {
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.retryOrderLoadFailed', [
+                'orderId' => $orderId,
+                'error'   => $loadError !== '' ? $loadError : 'order not found',
+            ]);
+            $this->pendingRepo->markFailed($row, 'retry: order could not be loaded');
+            return;
+        }
+
+        $this->attempt($order, $row);
+    }
+
+    /**
+     * One submit attempt. $row is the queue row this attempt belongs to, null on
+     * a fresh submit from the event procedure. The early exits that have nothing
+     * to do with the platform (no key, delivery orders, no address) close or park
+     * the row so the cron does not pick it up every five minutes for the same
+     * reason.
+     */
+    private function attempt(Order $order, ?PendingAddressCheck $row): void
     {
         $orderId = (int) $order->id;
 
@@ -73,6 +139,17 @@ class AddressCheckSubmitService
 
         if ($apiKey === '') {
             $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.missingConfig', ['orderId' => $orderId]);
+            if ($row !== null) {
+                // The key may be on its way; look again in an hour rather than every tick.
+                $nextAttemptAt = date('Y-m-d H:i:s', time() + self::RETRY_MAX_DELAY_SECONDS);
+                $this->pendingRepo->scheduleRetry($row, (int) $row->attempts, $nextAttemptAt, 'API key missing');
+                // error, not warning: a warning never shows in the Plenty log unless the
+                // merchant switches the plugin's log on, and a missing key must be seen.
+                $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.retryWaitingForConfig', [
+                    'orderId'       => $orderId,
+                    'nextAttemptAt' => $nextAttemptAt,
+                ]);
+            }
             return;
         }
 
@@ -83,6 +160,9 @@ class AddressCheckSubmitService
             $this->getLogger(__METHOD__)->info('HeistaAddressCheck::log.skippedHasDeliveryOrders', [
                 'orderId' => $orderId,
             ]);
+            if ($row !== null) {
+                $this->pendingRepo->markFailed($row, 'retry: skipped, order has delivery orders');
+            }
             return;
         }
 
@@ -108,6 +188,9 @@ class AddressCheckSubmitService
                 'orderId' => $orderId,
                 'error'   => $e->getMessage(),
             ]);
+            if ($row !== null) {
+                $this->pendingRepo->markFailed($row, 'retry: delivery address not found');
+            }
             return;
         }
 
@@ -138,39 +221,44 @@ class AddressCheckSubmitService
         ]);
         $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $endpointOverride, $shippingProvider, $email, $phone);
 
+        $item = $payload['items'][0];
+
         try {
             $jobId = $this->saasClient->submitJob($apiBaseUrl, $apiKey, $payload);
+        } catch (SaasRequestException $e) {
+            // Unreachable, 5xx or "wait": the address is fine as far as anyone knows,
+            // so the order keeps its status and the cron tries again. A refusal
+            // (bad key, empty wallet, invalid DHL credentials) will not change by
+            // asking again; the merchant has to act, and the note says what on.
+            if ($e->isRetryable()) {
+                $this->deferSubmit($orderId, $address, $row, $e, $item);
+            } else {
+                $this->rejectSubmit($orderId, $address, $row, $e, $item);
+            }
+            return;
         } catch (Throwable $e) {
-            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.submitFailed', [
-                'orderId' => $orderId,
-                'error'   => $e->getMessage(),
-            ]);
-            $this->pendingRepo->create([
-                'orderId'           => $orderId,
-                'jobId'             => '',
-                'deliveryAddressId' => (int) $address->id,
-                'status'            => PendingAddressCheck::STATUS_FAILED,
-                'submittedAt'       => date('Y-m-d H:i:s'),
-                'lastError'         => substr($e->getMessage(), 0, 1000),
-            ]);
-            // The check never reached the SaaS (bad/revoked key, network, 5xx).
-            // Route the order to the configured "processing error" status so the
-            // merchant sees it didn't run, instead of it silently staying put.
-            $this->applyErrorStatus($orderId);
+            $this->rejectSubmit($orderId, $address, $row, $e, $item);
             return;
         }
 
-        $this->pendingRepo->create([
-            'orderId'           => $orderId,
-            'jobId'             => $jobId,
-            'deliveryAddressId' => (int) $address->id,
-            'status'            => PendingAddressCheck::STATUS_PENDING,
-            'submittedAt'       => date('Y-m-d H:i:s'),
-        ]);
+        $attempts = $row !== null ? (int) $row->attempts + 1 : 1;
+        if ($row !== null) {
+            $this->pendingRepo->markPending($row, $jobId, $attempts);
+        } else {
+            $this->pendingRepo->create([
+                'orderId'           => $orderId,
+                'jobId'             => $jobId,
+                'deliveryAddressId' => (int) $address->id,
+                'status'            => PendingAddressCheck::STATUS_PENDING,
+                'submittedAt'       => date('Y-m-d H:i:s'),
+                'attempts'          => 1,
+            ]);
+        }
 
-        $this->report(__METHOD__, 'HeistaAddressCheck::log.submitted', [
-            'orderId' => $orderId,
-            'jobId'   => $jobId,
+        $this->report(__METHOD__, $attempts > 1 ? 'HeistaAddressCheck::log.resubmitted' : 'HeistaAddressCheck::log.submitted', [
+            'orderId'  => $orderId,
+            'jobId'    => $jobId,
+            'attempts' => $attempts,
         ]);
     }
 
@@ -559,55 +647,152 @@ class AddressCheckSubmitService
     }
 
     /**
-     * Route the order to the configured "processing error" status
-     * (Config.statusOnError, "Status bei Verarbeitungsfehler") after a submit
-     * failure. Soft-fail and best-effort: a status problem must never bubble
-     * out of the order-creation event procedure. Empty/non-numeric config means
-     * "leave the order alone" rather than failing.
-     *
-     * Mirrors the status-id parsing + processUnguarded write in
-     * AddressCheckApplyService::resolveTargetStatusId / updateOrderStatus — the
-     * submit path is intentionally decoupled from the apply path; keep the two
-     * in sync if the parsing rules change. Only the 'error' bucket applies here
-     * (the SaaS never ran), so there's no outputStatus switch.
+     * The platform could not be reached, failed on its side or asked us to wait.
+     * Park the order for another attempt; its status stays untouched, because
+     * nothing is known about the address yet. Once the retry window is used up,
+     * give up the way a refusal is handled: FAILED row, error status, and a note
+     * that names the attempts and the last cause, with the way to re-run it.
      */
-    private function applyErrorStatus(int $orderId): void
+    private function deferSubmit(int $orderId, Address $address, ?PendingAddressCheck $row, SaasRequestException $e, array $item): void
     {
-        $configKey = 'HeistaAddressCheck.statusOnError';
-        $raw       = trim((string) $this->config->get($configKey));
-        if ($raw === '') {
-            return;
+        $attempts       = ($row !== null ? (int) $row->attempts : 0) + 1;
+        $firstAttemptAt = $row !== null && $row->submittedAt !== '' ? (int) strtotime($row->submittedAt) : 0;
+        if ($firstAttemptAt <= 0) {
+            $firstAttemptAt = time();
         }
 
-        // Plenty status IDs are decimals like "5.1", "7", "8.4". Reject anything
-        // else with a warning so a typo'd config can't corrupt order routing.
-        if (!is_numeric($raw)) {
-            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.statusIdInvalid', [
-                'configKey' => $configKey,
-                'value'     => $raw,
-            ]);
-            return;
-        }
-
-        $statusId = (float) $raw;
-        if ($statusId <= 0) {
-            return;
-        }
-
-        try {
-            $this->authHelper->processUnguarded(function () use ($orderId, $statusId): void {
-                $this->orderRepo->updateOrder(['statusId' => $statusId], $orderId);
-            });
-            $this->report(__METHOD__, 'HeistaAddressCheck::log.errorStatusApplied', [
-                'orderId'  => $orderId,
-                'statusId' => $statusId,
-            ]);
-        } catch (Throwable $e) {
-            $this->getLogger(__METHOD__)->warning('HeistaAddressCheck::log.errorStatusUpdateFailed', [
+        if (time() - $firstAttemptAt >= self::RETRY_WINDOW_SECONDS) {
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.submitGivenUp', [
                 'orderId'        => $orderId,
-                'targetStatusId' => $statusId,
+                'attempts'       => $attempts,
+                'firstAttemptAt' => date('Y-m-d H:i:s', $firstAttemptAt),
                 'error'          => $e->getMessage(),
             ]);
+            $this->closeRow($orderId, $address, $row, $e->getMessage());
+            $this->apply->writeSubmitFailure($orderId, $item, sprintf(
+                'Die Plattform war nicht erreichbar: %d Versuche seit %s, zuletzt: %s. Ereignisaktion erneut ausführen, um die Prüfung neu anzustoßen.',
+                $attempts,
+                date('d.m.Y H:i', $firstAttemptAt),
+                $this->unreachableText($e)
+            ));
+            return;
         }
+
+        $retryAfter = $e->getRetryAfterSeconds();
+        $delay      = $retryAfter > 0
+            ? max(60, $retryAfter)
+            : (int) min(self::RETRY_MAX_DELAY_SECONDS, self::RETRY_BASE_DELAY_SECONDS * (2 ** ($attempts - 1)));
+        $nextAttemptAt = date('Y-m-d H:i:s', time() + $delay);
+
+        if ($row === null) {
+            $this->pendingRepo->create([
+                'orderId'           => $orderId,
+                'jobId'             => '',
+                'deliveryAddressId' => (int) $address->id,
+                'status'            => PendingAddressCheck::STATUS_RETRY,
+                'submittedAt'       => date('Y-m-d H:i:s'),
+                'lastError'         => substr($e->getMessage(), 0, 1000),
+                'attempts'          => 1,
+                'nextAttemptAt'     => $nextAttemptAt,
+            ]);
+        } else {
+            $this->pendingRepo->scheduleRetry($row, $attempts, $nextAttemptAt, $e->getMessage());
+        }
+
+        // report(), not warning(): a warning is invisible in the Plenty log until the
+        // merchant activates it, and "why was this order not checked yet" is exactly
+        // the question this line answers.
+        $this->report(__METHOD__, 'HeistaAddressCheck::log.submitDeferred', [
+            'orderId'       => $orderId,
+            'attempt'       => $attempts,
+            'httpStatus'    => $e->getHttpStatus(),
+            'nextAttemptAt' => $nextAttemptAt,
+            'error'         => $e->getMessage(),
+        ]);
+    }
+
+    /**
+     * The platform answered, and the answer will not change by asking again:
+     * FAILED row, configured error status, and an internal note that says what
+     * was refused and where to fix it. Before 1.8.0 the status was set and no
+     * note was written, so a merchant could not tell an unchecked order from a
+     * bad address.
+     */
+    private function rejectSubmit(int $orderId, Address $address, ?PendingAddressCheck $row, Throwable $e, array $item): void
+    {
+        $status = $e instanceof SaasRequestException ? $e->getHttpStatus() : 0;
+        $code   = $e instanceof SaasRequestException ? $e->getErrorCode() : '';
+
+        $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.submitRejected', [
+            'orderId'    => $orderId,
+            'httpStatus' => $status,
+            'code'       => $code,
+            'error'      => $e->getMessage(),
+        ]);
+        $this->closeRow($orderId, $address, $row, $e->getMessage());
+        $this->apply->writeSubmitFailure($orderId, $item, 'Die Plattform hat die Prüfung abgelehnt: ' . $this->refusalText($status, $code, $e));
+    }
+
+    /** Mark the queue row FAILED, creating it when this was the first attempt. */
+    private function closeRow(int $orderId, Address $address, ?PendingAddressCheck $row, string $error): void
+    {
+        if ($row !== null) {
+            $this->pendingRepo->markFailed($row, $error);
+            return;
+        }
+
+        $this->pendingRepo->create([
+            'orderId'           => $orderId,
+            'jobId'             => '',
+            'deliveryAddressId' => (int) $address->id,
+            'status'            => PendingAddressCheck::STATUS_FAILED,
+            'submittedAt'       => date('Y-m-d H:i:s'),
+            'lastError'         => substr($error, 0, 1000),
+            'attempts'          => 1,
+        ]);
+    }
+
+    /** Cause of an unreachable submit, for the order note. German like every note. */
+    private function unreachableText(SaasRequestException $e): string
+    {
+        $status = $e->getHttpStatus();
+        if ($status === 0) {
+            return 'keine Verbindung zur Plattform';
+        }
+        if ($status === 429) {
+            return 'die Plattform hat um Wartezeit gebeten (zu viele Anfragen)';
+        }
+        if ($status >= 500) {
+            return 'Fehler auf der Plattform (HTTP ' . $status . ')';
+        }
+
+        return 'HTTP ' . $status;
+    }
+
+    /**
+     * What a refusal means for the merchant and where to fix it, keyed on the
+     * platform's error code. Codes are the published v1 contract; anything else
+     * falls back to the bare status so the note still says something true.
+     */
+    private function refusalText(int $status, string $code, Throwable $e): string
+    {
+        switch ($code) {
+            case 'UNAUTHORIZED':
+                return 'API-Schlüssel ungültig oder widerrufen. Plugin-Konfiguration prüfen.';
+            case 'FORBIDDEN':
+                return 'Zugriff verweigert (HTTP 403). Abo und Berechtigung des API-Schlüssels im Heista-Portal prüfen.';
+            case 'INSUFFICIENT_BALANCE':
+                return 'Guthaben reicht nicht aus. Im Heista-Portal aufladen.';
+            case 'DHL_CREDENTIALS_INVALID':
+                return 'DHL-Zugangsdaten ungültig. Im Heista-Portal unter Adressprüfung prüfen.';
+            case 'VALIDATION_ERROR':
+                return 'Anfrage ungültig (HTTP 400). Bitte den Heista-Support informieren.';
+        }
+
+        if ($status > 0) {
+            return 'HTTP ' . $status . ($code !== '' ? ' ' . $code : '') . '.';
+        }
+
+        return substr($e->getMessage(), 0, 200);
     }
 }

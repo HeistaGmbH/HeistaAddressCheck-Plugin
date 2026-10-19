@@ -26,7 +26,7 @@ class SaasClient
      * of truth for what we report.
      */
     const CLIENT_NAME    = 'HeistaAddressCheck';
-    const CLIENT_VERSION = '1.7.1';
+    const CLIENT_VERSION = '1.8.0';
 
     public function submitJob(string $baseUrl, string $apiKey, array $body, int $connectTimeoutMs = 5000): string
     {
@@ -51,6 +51,10 @@ class SaasClient
 
     /**
      * @return array<string, mixed> Decoded JSON body (empty array if response had no body).
+     *
+     * @throws SaasRequestException on a transport error or any status >= 400, carrying the
+     *                              status, the platform's error code and its Retry-After, so
+     *                              the submit path can tell "try again later" from "refused".
      */
     private function request(string $method, string $url, string $apiKey, ?array $body, int $connectTimeoutMs): array
     {
@@ -68,6 +72,9 @@ class SaasClient
             CURLOPT_CONNECTTIMEOUT_MS => $connectTimeoutMs,
             CURLOPT_TIMEOUT           => 15,
             CURLOPT_FOLLOWLOCATION    => false,
+            // Response headers come back in front of the body, so a 429's
+            // Retry-After can be read without a header callback.
+            CURLOPT_HEADER            => true,
         ]);
 
         if ($body !== null) {
@@ -82,35 +89,56 @@ class SaasClient
 
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
 
-        $raw     = curl_exec($ch);
-        $errno   = curl_errno($ch);
-        $errmsg  = curl_error($ch);
-        $status  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $raw        = curl_exec($ch);
+        $errno      = curl_errno($ch);
+        $errmsg     = curl_error($ch);
+        $status     = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         curl_close($ch);
 
         if ($raw === false || $errno !== 0) {
-            throw new RuntimeException(sprintf('cURL %s %s failed: [%d] %s', $method, $url, $errno, $errmsg));
+            throw new SaasRequestException(sprintf('cURL %s %s failed: [%d] %s', $method, $url, $errno, $errmsg), 0);
         }
+
+        $rawHeaders = substr((string) $raw, 0, $headerSize);
+        $rawBody    = (string) substr((string) $raw, $headerSize);
 
         if ($status >= 400) {
-            throw new RuntimeException(sprintf(
-                'HTTP %s %s returned %d: %s',
-                $method,
-                $url,
+            $decoded = json_decode($rawBody, true);
+            $decoded = is_array($decoded) ? $decoded : [];
+            throw new SaasRequestException(
+                sprintf('HTTP %s %s returned %d: %s', $method, $url, $status, substr($rawBody, 0, 500)),
                 $status,
-                substr((string) $raw, 0, 500)
-            ));
+                self::retryAfterSeconds($rawHeaders, $decoded),
+                (string) ($decoded['error']['code'] ?? '')
+            );
         }
 
-        if ($raw === '' || $raw === null) {
+        if ($rawBody === '') {
             return [];
         }
 
-        $decoded = json_decode((string) $raw, true);
+        $decoded = json_decode($rawBody, true);
         if (!is_array($decoded)) {
-            throw new RuntimeException('Invalid JSON response: ' . substr((string) $raw, 0, 200));
+            throw new SaasRequestException('Invalid JSON response: ' . substr($rawBody, 0, 200), $status);
         }
 
         return $decoded;
+    }
+
+    /**
+     * Seconds the platform asked us to wait: its Retry-After header (always seconds,
+     * never a date, since 2026-10-19), else error.details.retryAfterSeconds from the
+     * body, else 0. Header names arrive lowercased over HTTP/2, hence the /i.
+     */
+    public static function retryAfterSeconds(string $rawHeaders, array $decodedBody): int
+    {
+        if (preg_match('/^Retry-After:\s*(\d+)\s*$/mi', $rawHeaders, $match) === 1) {
+            return (int) $match[1];
+        }
+
+        $fromBody = $decodedBody['error']['details']['retryAfterSeconds'] ?? null;
+
+        return is_numeric($fromBody) ? (int) $fromBody : 0;
     }
 }

@@ -58,7 +58,7 @@ unreachable), the cron-poll fallback still applies corrections.
 | `undeliverable` | no | Address not found — or not confirmable. Includes `reason: address_conflict`: the postal code / city could not be confirmed and the same street was found in a *different* postal area, so the address was deliberately **not** changed and the alternative is posted as an **Adress-Vorschlag** in the order comment | contact customer / fix manually |
 | `postnumber_invalid` | no | Packstation/Postfiliale post number invalid | request a valid post number |
 | `email_required` | no | Carrier needs an email and none is present (e.g. DPD) | request an email from the customer |
-| `error` | no | Check failed (no result / timeout) | retry — not the customer's fault |
+| `error` | no | Check failed (no result / timeout), the platform refused the submit (API key, balance, DHL credentials), or it stayed unreachable for 24 hours. The comment says which | retry, or fix what the comment names — not the customer's fault |
 | `error` (phone) | yes | The address passed, but DHL would refuse the label for the phone number (see below) | fix the phone number in the delivery address |
 
 Email source for the DPD check: the delivery address email (`AddressOption::TYPE_EMAIL`), falling back to the order's billing address email.
@@ -103,6 +103,23 @@ are not checked.
   only when the delivery orders already exist at submit time, and when one
   appears while the check is running, the address and the comment are still
   written and only the status write is dropped.
+
+**When the platform cannot be reached (since 1.8.0)**
+
+A submit that fails because the platform did not answer, answered with a 5xx or
+asked the plugin to wait (429) is queued and retried by the five-minute cron:
+after 5 minutes, then at doubling intervals up to an hour, and a `Retry-After`
+from the platform is honoured as given. The order keeps its status meanwhile,
+because nothing is known about the address yet. After 24 hours the plugin
+stops, moves the order to `statusOnError` and posts an internal comment naming
+the attempts and the last cause, so an unchecked order never looks like a
+checked one. Re-running the event action on a queued order submits it at once
+instead of opening a second queue entry.
+
+A refusal that no retry can fix (invalid API key, empty wallet, invalid DHL
+credentials, a request the platform rejects) goes to `statusOnError`
+immediately, with a comment that says what was refused and where to fix it.
+Before 1.8.0 both cases set the status and wrote nothing.
 
 **Shipping mapping**
 
