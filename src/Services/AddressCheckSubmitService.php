@@ -789,6 +789,17 @@ class AddressCheckSubmitService
                 return 'Anfrage ungültig (HTTP 400). Bitte den Heista-Support informieren.';
         }
 
+        // The platform's auth layer answers an invalid key with a bare 401 and no
+        // error code (seen live 2026-10-19), so the status has to carry the meaning.
+        switch ($status) {
+            case 401:
+                return 'API-Schlüssel ungültig oder widerrufen (HTTP 401). Plugin-Konfiguration prüfen.';
+            case 402:
+                return 'Guthaben reicht nicht aus (HTTP 402). Im Heista-Portal aufladen.';
+            case 403:
+                return 'Zugriff verweigert (HTTP 403). Abo und Berechtigung des API-Schlüssels im Heista-Portal prüfen.';
+        }
+
         if ($status > 0) {
             return 'HTTP ' . $status . ($code !== '' ? ' ' . $code : '') . '.';
         }
