@@ -15,6 +15,8 @@ use Plenty\Modules\Plugin\DataBase\Contracts\Model;
  * @property string $lastError
  * @property int    $attempts      submit attempts made so far (1.8.0)
  * @property string $nextAttemptAt when a RETRY row is due again, '' otherwise (1.8.0)
+ * @property bool   $b2bCheck      submitted through the business customer procedure (1.9.0).
+ *                  A retry sends the flag again, and the duplicate guard reads it.
  */
 class PendingAddressCheck extends Model
 {
@@ -38,6 +40,7 @@ class PendingAddressCheck extends Model
     public $lastError         = '';
     public $attempts          = 0;
     public $nextAttemptAt     = '';
+    public $b2bCheck  = false;
 
     public function getTableName(): string
     {

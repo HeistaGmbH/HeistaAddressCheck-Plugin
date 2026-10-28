@@ -54,6 +54,17 @@ class AddressCheckSubmitService
     private const RETRY_BASE_DELAY_SECONDS = 300;
     private const RETRY_MAX_DELAY_SECONDS  = 3600;
 
+    /**
+     * Duplicate guard (1.9.0). Plenty runs every event action whose filter matches, so a
+     * merchant whose two filters overlap submits one order through both procedures: two
+     * jobs, two notes, two status writes racing, billed twice. Inside this window a submit
+     * from the other procedure is resolved instead of sent (see submitForOrder). Ten
+     * minutes: two procedures on one event fire within a second, a merchant's deliberate
+     * re-run after fixing an address comes minutes to hours later. A constant, not a config
+     * key, because nobody has a reason to tune it.
+     */
+    private const DUPLICATE_WINDOW_SECONDS = 600;
+
     public function __construct(
         SaasClient $saasClient,
         OrderAddressRepositoryContract $orderAddressRepo,
@@ -81,14 +92,96 @@ class AddressCheckSubmitService
     }
 
     /**
-     * Entry point of the event procedure. An order that already sits in the
+     * Entry point of both event procedures. An order that already sits in the
      * retry queue (the merchant re-ran the action by hand) is attempted now on
      * its existing row instead of getting a second one that would submit the
      * same address twice later.
+     *
+     * $options['b2bCheck'] is set by the business customer procedure (1.9.0).
+     *
+     * Before that, the duplicate guard: when the OTHER procedure submitted this
+     * order inside DUPLICATE_WINDOW_SECONDS, the business customer check wins and
+     * only one job exists. A plain submit after a business customer one is dropped
+     * (the order already gets the superset). A business customer submit after a plain one
+     * upgrades a still-queued RETRY row, and otherwise writes a note on the order,
+     * because the plain job is already at the platform and cannot be given the
+     * flag afterwards. The same procedure twice behaves exactly as 1.8.0, so a
+     * merchant with one procedure never meets the guard. The cron path
+     * (resubmit) never comes through here, so a queued row cannot block itself.
      */
-    public function submitForOrder(Order $order): void
+    public function submitForOrder(Order $order, array $options = []): void
     {
-        $this->attempt($order, $this->pendingRepo->findRetryByOrderId((int) $order->id));
+        $orderId   = (int) $order->id;
+        $requested = !empty($options['b2bCheck']);
+
+        $recent = $this->findRecentSubmit($orderId);
+        if ($recent !== null && $this->rowRequestsB2bCheck($recent) !== $requested) {
+            if (!$requested) {
+                $this->getLogger(__METHOD__)->info('HeistaAddressCheck::log.duplicateSubmitSkipped', [
+                    'orderId' => $orderId,
+                    'jobId'   => (string) $recent->jobId,
+                    'status'  => (string) $recent->status,
+                ]);
+                return;
+            }
+
+            if ($recent->status === PendingAddressCheck::STATUS_RETRY) {
+                $recent = $this->pendingRepo->markB2bRequested($recent);
+                $this->report(__METHOD__, 'HeistaAddressCheck::log.duplicateSubmitUpgraded', [
+                    'orderId' => $orderId,
+                ]);
+                $this->attempt($order, $recent, ['b2bCheck' => true]);
+                return;
+            }
+
+            $this->report(__METHOD__, 'HeistaAddressCheck::log.duplicateSubmitNoted', [
+                'orderId' => $orderId,
+                'jobId'   => (string) $recent->jobId,
+                'status'  => (string) $recent->status,
+            ]);
+            $this->apply->writeB2bOverlapNote($orderId, (string) $recent->jobId);
+            return;
+        }
+
+        $retryRow = $this->pendingRepo->findRetryByOrderId($orderId);
+
+        // A RETRY row older than the window, from the other procedure: the row is still the
+        // one submit this order gets, so it carries the business customer check if either side
+        // asked for it. Never reached when both sides are the same procedure, which is the
+        // only case 1.8.0 knew.
+        if ($retryRow !== null && $requested && !$this->rowRequestsB2bCheck($retryRow)) {
+            $retryRow = $this->pendingRepo->markB2bRequested($retryRow);
+        }
+        $b2b = $requested || ($retryRow !== null && $this->rowRequestsB2bCheck($retryRow));
+
+        $this->attempt($order, $retryRow, ['b2bCheck' => $b2b]);
+    }
+
+    /**
+     * The guard's read, failing open: a repository error is logged and the order is
+     * submitted as it would be without the guard. An unchecked address is worse than a
+     * double one.
+     */
+    private function findRecentSubmit(int $orderId): ?PendingAddressCheck
+    {
+        try {
+            return $this->pendingRepo->findRecentByOrderId($orderId, self::DUPLICATE_WINDOW_SECONDS);
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.duplicateGuardFailed', [
+                'orderId' => $orderId,
+                'error'   => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * The stored flag as a bool. The database may hand it back as 0/1 or "0"/"1"
+     * rather than a PHP bool, and "0" is truthy, so no plain cast.
+     */
+    private function rowRequestsB2bCheck(PendingAddressCheck $row): bool
+    {
+        return filter_var($row->b2bCheck, FILTER_VALIDATE_BOOLEAN);
     }
 
     /**
@@ -120,7 +213,9 @@ class AddressCheckSubmitService
             return;
         }
 
-        $this->attempt($order, $row);
+        // The row remembers which procedure queued it, so the retry sends what the first
+        // attempt would have sent.
+        $this->attempt($order, $row, ['b2bCheck' => $this->rowRequestsB2bCheck($row)]);
     }
 
     /**
@@ -129,10 +224,14 @@ class AddressCheckSubmitService
      * to do with the platform (no key, delivery orders, no address) close or park
      * the row so the cron does not pick it up every five minutes for the same
      * reason.
+     *
+     * $options['b2bCheck'] puts the flag on the item and on every row this
+     * attempt creates, so a retry and the duplicate guard both see it.
      */
-    private function attempt(Order $order, ?PendingAddressCheck $row): void
+    private function attempt(Order $order, ?PendingAddressCheck $row, array $options = []): void
     {
-        $orderId = (int) $order->id;
+        $orderId     = (int) $order->id;
+        $b2b = !empty($options['b2bCheck']);
 
         $environment = (string) $this->config->get('HeistaAddressCheck.environment', PlatformEnvironment::PRODUCTION);
         $apiKey      = trim((string) $this->config->get('HeistaAddressCheck.apiKey'));
@@ -219,7 +318,7 @@ class AddressCheckSubmitService
             'plentyId'    => (int) pluginApp(Application::class)->getPlentyId(),
             'callbackUrl' => $callbackUrl,
         ]);
-        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $endpointOverride, $shippingProvider, $email, $phone);
+        $payload     = $this->buildPayload($orderId, $address, $callbackUrl, $callbackSecret, $endpointOverride, $shippingProvider, $email, $phone, $b2b);
 
         $item = $payload['items'][0];
 
@@ -252,6 +351,7 @@ class AddressCheckSubmitService
                 'status'            => PendingAddressCheck::STATUS_PENDING,
                 'submittedAt'       => date('Y-m-d H:i:s'),
                 'attempts'          => 1,
+                'b2bCheck'  => $b2b,
             ]);
         }
 
@@ -282,7 +382,7 @@ class AddressCheckSubmitService
         return 'https://p' . $plentyId . '.my.plentysystems.com/rest/heista/address-check/callback';
     }
 
-    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $endpointOverride = '', string $shippingProvider = '', string $email = '', string $phone = ''): array
+    private function buildPayload(int $orderId, Address $address, string $callbackUrl, string $callbackSecret, string $endpointOverride = '', string $shippingProvider = '', string $email = '', string $phone = '', bool $b2bCheck = false): array
     {
         $countryIso = '';
         if (!empty($address->countryId)) {
@@ -325,6 +425,14 @@ class AddressCheckSubmitService
         // Only sent when there is one: no phone means nothing to check, and nothing to hand over.
         if ($phone !== '') {
             $item['phone'] = $phone;
+        }
+
+        // Only from the business customer procedure (1.9.0). An item key, not a config key: the
+        // platform accepts unknown item keys and stores them, while an unknown config key is
+        // a 400 this plugin treats as a refusal. Omitted otherwise, so a plain submit is
+        // byte-identical to 1.8.0.
+        if ($b2bCheck) {
+            $item['b2bCheck'] = true;
         }
 
         $payload = [
@@ -668,7 +776,7 @@ class AddressCheckSubmitService
                 'firstAttemptAt' => date('Y-m-d H:i:s', $firstAttemptAt),
                 'error'          => $e->getMessage(),
             ]);
-            $this->closeRow($orderId, $address, $row, $e->getMessage());
+            $this->closeRow($orderId, $address, $row, $e->getMessage(), !empty($item['b2bCheck']));
             $this->apply->writeSubmitFailure($orderId, $item, sprintf(
                 'Die Plattform war nicht erreichbar: %d Versuche seit %s, zuletzt: %s. Ereignisaktion erneut ausführen, um die Prüfung neu anzustoßen.',
                 $attempts,
@@ -694,6 +802,8 @@ class AddressCheckSubmitService
                 'lastError'         => substr($e->getMessage(), 0, 1000),
                 'attempts'          => 1,
                 'nextAttemptAt'     => $nextAttemptAt,
+                // The item is what was actually sent, so the retry sends the same thing.
+                'b2bCheck'  => !empty($item['b2bCheck']),
             ]);
         } else {
             $this->pendingRepo->scheduleRetry($row, $attempts, $nextAttemptAt, $e->getMessage());
@@ -729,12 +839,15 @@ class AddressCheckSubmitService
             'code'       => $code,
             'error'      => $e->getMessage(),
         ]);
-        $this->closeRow($orderId, $address, $row, $e->getMessage());
+        $this->closeRow($orderId, $address, $row, $e->getMessage(), !empty($item['b2bCheck']));
         $this->apply->writeSubmitFailure($orderId, $item, 'Die Plattform hat die Prüfung abgelehnt: ' . $this->refusalText($status, $code, $e));
     }
 
-    /** Mark the queue row FAILED, creating it when this was the first attempt. */
-    private function closeRow(int $orderId, Address $address, ?PendingAddressCheck $row, string $error): void
+    /**
+     * Mark the queue row FAILED, creating it when this was the first attempt. A created row
+     * keeps the procedure's flag, so the duplicate guard still knows which one it was.
+     */
+    private function closeRow(int $orderId, Address $address, ?PendingAddressCheck $row, string $error, bool $b2bCheck = false): void
     {
         if ($row !== null) {
             $this->pendingRepo->markFailed($row, $error);
@@ -749,6 +862,7 @@ class AddressCheckSubmitService
             'submittedAt'       => date('Y-m-d H:i:s'),
             'lastError'         => substr($error, 0, 1000),
             'attempts'          => 1,
+            'b2bCheck'  => $b2bCheck,
         ]);
     }
 

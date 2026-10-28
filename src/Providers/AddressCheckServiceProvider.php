@@ -3,6 +3,7 @@
 namespace HeistaAddressCheck\Providers;
 
 use HeistaAddressCheck\Crons\FallbackPollCron;
+use HeistaAddressCheck\Procedures\SubmitAddressCheckB2bProcedure;
 use HeistaAddressCheck\Procedures\SubmitAddressCheckProcedure;
 use Plenty\Modules\Cron\Services\CronContainer;
 use Plenty\Modules\EventProcedures\Services\Entries\ProcedureEntry;
@@ -37,6 +38,22 @@ class AddressCheckServiceProvider extends ServiceProvider
                 'en' => 'Validate address via Heista SaaS',
             ],
             SubmitAddressCheckProcedure::class . '@run'
+        );
+
+        // 1.9.0. Same rule for the module name as above: it is never renamed once shipped.
+        // The merchant binds this procedure to the orders that need the business customer
+        // check through the filters of a flow (or a classic event action); everything else
+        // keeps using submitAddressCheck. The duplicate guard in AddressCheckSubmitService
+        // handles an order that matches both. The label starts like the plain one's on
+        // purpose, so the two read as siblings in the action picker.
+        $eventProceduresService->registerProcedure(
+            'submitAddressCheckB2b',
+            ProcedureEntry::EVENT_TYPE_ORDER,
+            [
+                'de' => 'Adresse via Heista SaaS prüfen, mit Geschäftskundenprüfung',
+                'en' => 'Validate address via Heista SaaS, with business customer check',
+            ],
+            SubmitAddressCheckB2bProcedure::class . '@run'
         );
 
         $cronContainer->add(CronContainer::EVERY_FIVE_MINUTES, FallbackPollCron::class);

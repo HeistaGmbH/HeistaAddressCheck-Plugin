@@ -47,6 +47,9 @@ unreachable), the cron-poll fallback still applies corrections.
   `statusOnError` – order status IDs to set per outcome. Leave empty to keep the
   current status. See the outcome table below for what each means and the
   recommended next step.
+- `statusOnB2bReview`, `statusOnB2bMismatch` (since 1.9.0): order status IDs for
+  the business customer check, see *Business customer check* below. An empty
+  mismatch status falls back to the review status.
 - `commentAuthorUserId` – PlentyONE user ID under which the result comment is
   created. Leave empty to skip the comment.
 
@@ -60,6 +63,8 @@ unreachable), the cron-poll fallback still applies corrections.
 | `email_required` | no | Carrier needs an email and none is present (e.g. DPD) | request an email from the customer |
 | `error` | no | Check failed (no result / timeout), the platform refused the submit (API key, balance, DHL credentials), or it stayed unreachable for 24 hours. The comment says which | retry, or fix what the comment names — not the customer's fault |
 | `error` (phone) | yes | The address passed, but DHL would refuse the label for the phone number (see below) | fix the phone number in the delivery address |
+| business customer review | yes | The address passed, but the recipient was not confirmed or not found, could not be checked, or the order was placed with a private email address (see below) | check by hand as before, the comment names the reason |
+| business customer mismatch | yes | The address passed, but something other than the chosen kinds of recipient is listed there | check by hand, the recipient is likely not who the order claims |
 
 Email source for the DPD check: the delivery address email (`AddressOption::TYPE_EMAIL`), falling back to the order's billing address email.
 
@@ -120,6 +125,83 @@ A refusal that no retry can fix (invalid API key, empty wallet, invalid DHL
 credentials, a request the platform rejects) goes to `statusOnError`
 immediately, with a comment that says what was refused and where to fix it.
 Before 1.8.0 both cases set the status and wrote nothing.
+
+**Business customer check (since 1.9.0)**
+
+The same section, written for merchants, is in the plugin's user guide
+(`meta/documents/user_guide_de.md`, `user_guide_en.md`).
+
+For merchants who ship to businesses and public bodies (schools, Kitas,
+authorities, practices, companies). Two checks run on top of the address check:
+
+- **Check the recipient at the address** ("Empfänger an der Adresse prüfen"):
+  the lookup uses the company name and the delivery address, and confirms that a
+  recipient of the kind chosen under "Who you deliver to" is listed there (whole
+  areas or single kinds). It confirms the kind of recipient, not the company
+  name. Without a company name the check is not possible; the comment says so and
+  the order goes to review. Person names are never used. €0.025 per checked
+  address on top of the plan.
+- **Flag private email addresses** ("Private E-Mail-Adressen markieren"): was the
+  order placed with an address of a private email provider (web.de, GMX, Gmail
+  and others). Such an order goes to review even when the recipient is confirmed,
+  because a real business ordered from a private mailbox is the pattern behind
+  rerouted deliveries. Free.
+
+Both are switched on and configured in the Heista dashboard, not in the plugin:
+Services → Address Check → tab "Setup" → step "Model, DHL access and business
+customer check" → section "Business customer check" (DE: Services → Adressprüfung
+→ Tab „Einrichtung“ → Schritt „Modell, DHL-Zugang und Geschäftskundenprüfung“ →
+Abschnitt „Geschäftskundenprüfung“). There the merchant picks which orders are
+checked ("Only orders from the plugin action with business customer check",
+"Orders with a company name", "Every order"), the kinds of recipient, and whether
+every mail provider on the list is flagged or only selected ones (for example
+only web.de), plus domains of their own.
+
+The plugin brings **two plugin actions** (procedures). The merchant builds the
+**flows** in plentyONE themselves, under Automatisierung → Flow Studio, on order
+creation:
+
+- **SubmitAddressCheck → Adresse via Heista SaaS prüfen** (`submitAddressCheck`):
+  the address check as before. The business customer check runs too when the
+  dashboard says "Orders with a company name" or "Every order".
+- **SubmitAddressCheckB2b → Adresse via Heista SaaS prüfen, mit
+  Geschäftskundenprüfung** (`submitAddressCheckB2b`, en "Validate address via
+  Heista SaaS, with business customer check"): the address check plus the
+  business customer check for every order through this action, with the
+  dashboard set to "Only orders from the plugin action with business customer
+  check".
+
+Classic event procedures (Einrichtung → Aufträge → Ereignisaktionen) offer the
+same two procedures under the same names.
+
+Recipe A, a shop that ships only to businesses: one flow with the plain action,
+dashboard set to "Orders with a company name" or "Every order".
+
+Recipe B, a mixed shop: two flows on the same trigger with mutually exclusive
+filters. Flow 1 filters to business orders (payment method, customer class or
+tag) and runs the action with the business customer check. Flow 2 filters to
+everything else and runs the plain action. The dashboard is set to "Only orders
+from the plugin action with business customer check".
+
+The two filters must exclude each other. If an order matches both anyway, the
+plugin sends it once, never twice, and the business customer check wins: a plain
+submit within ten minutes of a business customer submit for the same order is
+dropped, and a queued plain submit is upgraded. If the plain submit already
+reached the platform, the business customer check is not started and the order
+gets an internal comment: "Die Filter Ihrer beiden Automatisierungen überschneiden
+sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft." Running the same action
+twice behaves exactly as before.
+
+Results land in the internal order comment as a "Geschäftskundenprüfung" and an
+"E-Mail-Prüfung" line. A result that needs a human moves an order whose address
+would otherwise ship to `statusOnB2bReview`, or to `statusOnB2bMismatch` when
+something else is listed at the address. The email result uses the review status.
+A phone the label would be refused for still goes to `statusOnError` first. The
+email checked is the one the plugin already sends: the delivery address email,
+else the billing address email.
+
+An older plugin keeps working against the same platform: the checks may run
+there too, but nothing about them is shown on the order.
 
 **Shipping mapping**
 

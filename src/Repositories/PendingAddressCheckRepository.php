@@ -26,6 +26,52 @@ class PendingAddressCheckRepository
         $row->lastError         = (string) ($attributes['lastError']         ?? '');
         $row->attempts          = (int)    ($attributes['attempts']          ?? 0);
         $row->nextAttemptAt     = (string) ($attributes['nextAttemptAt']     ?? '');
+        $row->b2bCheck  = !empty($attributes['b2bCheck']);
+        return $this->db->save($row);
+    }
+
+    /**
+     * The newest row of an order whose first submit lies inside the last
+     * $withinSeconds, whatever its status, or null. Read by the duplicate guard
+     * (1.9.0), which has to know whether the other procedure already submitted
+     * this order a moment ago. `submittedAt` is the same `Y-m-d H:i:s` string
+     * every write uses, so the bound is computed the way findRetryDue computes
+     * `now`. Newest is picked here rather than in the query: an order has a
+     * handful of rows at most, and this needs no ordering support from the
+     * query builder.
+     */
+    public function findRecentByOrderId(int $orderId, int $withinSeconds): ?PendingAddressCheck
+    {
+        $since = date('Y-m-d H:i:s', time() - $withinSeconds);
+
+        $rows = $this->db->query(PendingAddressCheck::class)
+            ->where('orderId', '=', $orderId)
+            ->where('submittedAt', '>=', $since)
+            ->get();
+
+        $newest = null;
+        foreach ($rows as $row) {
+            if ($newest === null) {
+                $newest = $row;
+                continue;
+            }
+            $cmp = strcmp((string) $row->submittedAt, (string) $newest->submittedAt);
+            if ($cmp > 0 || ($cmp === 0 && (int) $row->id > (int) $newest->id)) {
+                $newest = $row;
+            }
+        }
+
+        return $newest;
+    }
+
+    /**
+     * A queued plain submit is upgraded when the business customer procedure fires for
+     * the same order: the one job that results carries the flag, and every later
+     * retry of the row sends it again.
+     */
+    public function markB2bRequested(PendingAddressCheck $row): PendingAddressCheck
+    {
+        $row->b2bCheck = true;
         return $this->db->save($row);
     }
 

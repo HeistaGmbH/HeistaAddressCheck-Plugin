@@ -116,6 +116,24 @@
             "defaultValue": ""
           }
         },
+        "statusOnB2bReview": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnB2bReviewLabel",
+          "options": {
+            "tooltip": "Config.statusOnB2bReviewTooltip",
+            "defaultValue": ""
+          }
+        },
+        "statusOnB2bMismatch": {
+          "type": "inputText",
+          "required": false,
+          "label": "Config.statusOnB2bMismatchLabel",
+          "options": {
+            "tooltip": "Config.statusOnB2bMismatchTooltip",
+            "defaultValue": ""
+          }
+        },
         "commentAuthorUserId": {
           "type": "inputText",
           "required": false,

@@ -190,6 +190,8 @@ class AddressCheckApplyService
                 'outputStatus'    => $outputStatus,
                 'outputReason'    => (string) ($output['reason'] ?? ''),
                 'phoneStatus'     => (string) ($output['phoneStatus'] ?? ''),
+                'recipientStatus' => (string) ($output['recipientStatus'] ?? ''),
+                'freemailStatus'  => (string) ($output['freemailStatus'] ?? ''),
                 'creditsConsumed' => (int)    ($output['creditsConsumed'] ?? 0),
                 'targetStatusId'  => $targetStatusId,
             ]);
@@ -459,9 +461,24 @@ class AddressCheckApplyService
         // next step has to say so, or the note reads "Keine Aktion nötig" on an order that was
         // just moved to the error status.
         $nextStep = $this->nextStepText($outputStatus, $outputReason);
-        if ($this->statusBucket($outputStatus, $output) !== $outputStatus) {
+        $bucket   = $this->statusBucket($outputStatus, $output);
+        if ($bucket === 'error' && $outputStatus !== 'error') {
             $phoneStep = 'Telefonnummer in der Lieferadresse korrigieren, sonst lehnt DHL das Versandlabel ab. Details unten.';
             $nextStep  = $outputStatus === 'review_suggested' ? $phoneStep . ' Zur Adresse: ' . $nextStep : $phoneStep;
+        } elseif ($bucket === 'b2b_review' || $bucket === 'b2b_mismatch') {
+            // Same reasoning as the phone: the note must not say "Keine Aktion nötig" on an
+            // order the recipient or email result just held back.
+            $recipientMoved = $bucket === 'b2b_mismatch' || $this->recipientNeedsReview($output);
+            $emailMoved     = $this->freemailNeedsReview($output);
+            if ($recipientMoved && $emailMoved) {
+                $stepKey = 'recipient_email_review';
+            } elseif ($recipientMoved) {
+                $stepKey = 'recipient_review';
+            } else {
+                $stepKey = 'email_review';
+            }
+            $recipientStep = $this->nextStepText($stepKey);
+            $nextStep      = $outputStatus === 'review_suggested' ? $recipientStep . ' Zur Adresse: ' . $nextStep : $recipientStep;
         }
 
         $body  = '<p><strong>Heista Adressprüfung</strong><br>';
@@ -469,6 +486,8 @@ class AddressCheckApplyService
         $body .= 'Nächster Schritt: ' . htmlspecialchars($nextStep, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
 
         $body .= $this->formatPhoneBlock($input, $output);
+
+        $body .= $this->formatB2bBlock($output);
 
         // DHL's verbatim validation lines. For a dhl_only merchant this is the entire
         // explanation of the verdict — nothing else ran on that path.
@@ -583,6 +602,167 @@ class AddressCheckApplyService
     }
 
     /**
+     * Returns the "Geschäftskundenprüfung" and "E-Mail-Prüfung" lines for the order comment
+     * (1.9.0), or '' when neither check ran. Each line is the result in the merchant's words.
+     * Never a listing name, never the matched place type (`recipientType` is deliberately not
+     * read) and never the name of the service behind the check.
+     */
+    private function formatB2bBlock(array $output): string
+    {
+        $lines = [];
+
+        $recipient = $this->recipientResultText($output);
+        if ($recipient !== '') {
+            $lines[] = '<strong>Geschäftskundenprüfung:</strong> ' . htmlspecialchars($recipient, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+
+        $email = $this->freemailResultText($output);
+        if ($email !== '') {
+            $lines[] = '<strong>E-Mail-Prüfung:</strong> ' . htmlspecialchars($email, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+
+        return empty($lines) ? '' : '<p>' . implode('<br>', $lines) . '</p>';
+    }
+
+    /**
+     * German label per recipient group key, as the merchant chooses them in the Heista
+     * dashboard. Printed in the note instead of the key.
+     */
+    private const RECIPIENT_GROUP_LABELS = [
+        'education'      => 'Bildung und Kinderbetreuung',
+        'government'     => 'Behörden und öffentliche Stellen',
+        'health'         => 'Gesundheit und Wellness',
+        'business'       => 'Unternehmen und Gewerbe',
+        'services'       => 'Dienstleistungen',
+        'shopping'       => 'Handel',
+        'food'           => 'Gastronomie',
+        'lodging'        => 'Unterkünfte',
+        'automotive'     => 'Auto und Kfz',
+        'finance'        => 'Finanzen',
+        'culture'        => 'Kultur',
+        'entertainment'  => 'Freizeit und Veranstaltungen',
+        'sports'         => 'Sport',
+        'worship'        => 'Religiöse Einrichtungen',
+        'facilities'     => 'Öffentliche Anlagen',
+        'transportation' => 'Verkehr',
+    ];
+
+    /**
+     * The recipient result as one German sentence, '' when there is nothing to say (the
+     * check did not run, or was not wanted for this order). A group this build does not
+     * know (one the platform added later) prints "Empfänger bestätigt" without the
+     * parenthesis, never the raw key.
+     */
+    private function recipientResultText(array $output): string
+    {
+        $status = (string) ($output['recipientStatus'] ?? '');
+        $reason = (string) ($output['recipientReason'] ?? '');
+
+        switch ($status) {
+            case '':
+                return '';
+            case 'verified':
+                $group  = (string) ($output['recipientGroup'] ?? '');
+                $labels = self::RECIPIENT_GROUP_LABELS;
+                return isset($labels[$group]) ? 'Empfänger bestätigt (' . $labels[$group] . ')' : 'Empfänger bestätigt';
+            case 'unconfirmed':
+                if ($reason === 'related_type') {
+                    return 'Empfänger nicht bestätigt. An der Adresse ist ein ähnlicher Eintrag, aber keiner der gewählten Arten. Bitte wie bisher prüfen.';
+                }
+                return 'Empfänger nicht bestätigt. An der Adresse ist ein Eintrag ohne eindeutige Art. Bitte wie bisher prüfen.';
+            case 'mismatch':
+                return 'Widerspruch. An der Adresse ist etwas anderes eingetragen als die gewählten Empfängerarten.';
+            case 'not_found':
+                return 'nicht gefunden. Kein Empfänger der gewählten Art unter dieser Adresse bekannt. Bitte wie bisher prüfen.';
+            case 'skipped':
+                switch ($reason) {
+                    case 'no_company':
+                        return 'nicht möglich, kein Firmenname in der Lieferadresse.';
+                    case 'not_enabled':
+                        return 'nicht aktiviert (Einstellung im Heista-Dashboard).';
+                    case 'not_requested':
+                        return '';
+                    default:
+                        return 'nicht geprüft. Bitte wie bisher prüfen.';
+                }
+            case 'error':
+                return 'derzeit nicht möglich. Bitte wie bisher prüfen.';
+            default:
+                // A status this build does not know. statusBucket() treats it as a review
+                // case, so the note has to say why the order was held back.
+                return 'Ergebnis nicht auswertbar. Bitte wie bisher prüfen.';
+        }
+    }
+
+    /**
+     * The email result as one German sentence, '' when the email check did not run.
+     * `other_domain` means only "not on the list": nothing compared the domain with the
+     * recipient, so the sentence claims no more than that.
+     */
+    private function freemailResultText(array $output): string
+    {
+        switch ((string) ($output['freemailStatus'] ?? '')) {
+            case 'freemail':
+                $domain = trim((string) ($output['freemailDomain'] ?? ''));
+                return 'private E-Mail-Adresse' . ($domain !== '' ? ' (' . $domain . ')' : '') . '. Bitte wie bisher prüfen.';
+            case 'other_domain':
+                return 'kein privater Anbieter erkannt.';
+            case 'no_email':
+                return 'keine E-Mail-Adresse in der Bestellung.';
+            default:
+                return '';
+        }
+    }
+
+    /**
+     * Internal note for the duplicate guard (1.9.0): the business customer procedure fired for
+     * an order the plain procedure had already submitted, so no business customer check was
+     * started.
+     * Its own note, not part of a result block, because no job exists for it. Changes no
+     * status. Soft-fail like every comment: never throws into the submit path.
+     *
+     * @param string $earlierJobId the plain submit's job, '' when it never reached the platform
+     */
+    public function writeB2bOverlapNote(int $orderId, string $earlierJobId): void
+    {
+        $authorUserId = $this->resolveCommentAuthorUserId();
+        if ($authorUserId === null) {
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentSkippedNoUser', [
+                'jobId'   => $earlierJobId,
+                'orderId' => $orderId,
+            ]);
+            return;
+        }
+
+        $text = 'Geschäftskundenprüfung nicht gestartet: Der Adresscheck für diesen Auftrag läuft bereits ohne Geschäftskundenprüfung'
+              . ($earlierJobId !== '' ? ' (Job ' . $earlierJobId . ')' : '')
+              . '. Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft.';
+        $html = '<p><strong>Heista Adressprüfung</strong><br>'
+              . htmlspecialchars($text, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
+
+        try {
+            $commentId = $this->authHelper->processUnguarded(function () use ($orderId, $html, $authorUserId): int {
+                return $this->createComment($orderId, $html, $authorUserId);
+            });
+            $this->report(__METHOD__, 'HeistaAddressCheck::log.commentCreated', [
+                'jobId'     => $earlierJobId,
+                'orderId'   => $orderId,
+                'commentId' => $commentId,
+                'userId'    => $authorUserId,
+                'applied'   => '0',
+            ]);
+        } catch (Throwable $e) {
+            $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentCreateFailed', [
+                'jobId'   => $earlierJobId,
+                'orderId' => $orderId,
+                'userId'  => $authorUserId,
+                'error'   => $e->getMessage(),
+                'class'   => get_class($e),
+            ]);
+        }
+    }
+
+    /**
      * Human-readable German label for an outcome status, shown in the order
      * comment. A reason code can refine the label where a status bucket covers
      * several distinct causes (e.g. undeliverable = not-found vs no house
@@ -664,6 +844,12 @@ class AddressCheckApplyService
             case 'postnumber_invalid': return 'Gültige Postnummer beim Kunden anfordern (Packstation/Postfiliale).';
             case 'email_required':     return 'E-Mail-Adresse beim Kunden anfordern – für den DPD-Versand erforderlich.';
             case 'error':              return 'Erneut versuchen – die Prüfung ist fehlgeschlagen (kein Ergebnis).';
+            // 1.9.0, chosen by formatResultComment() when the recipient or the email result of
+            // the business customer check held back an order the address alone would have let
+            // through.
+            case 'recipient_review':       return 'Empfänger prüfen. Details unten.';
+            case 'email_review':           return 'E-Mail-Adresse prüfen. Bestellt wurde mit einer privaten E-Mail-Adresse, Details unten.';
+            case 'recipient_email_review': return 'Empfänger und E-Mail-Adresse prüfen. Details unten.';
             default:                   return 'Bitte manuell prüfen.';
         }
     }
@@ -715,6 +901,15 @@ class AddressCheckApplyService
             case 'postnumber_invalid': $configKey = 'HeistaAddressCheck.statusOnPostnumberInvalid'; break;
             case 'email_required':     $configKey = 'HeistaAddressCheck.statusOnEmailRequired';     break;
             case 'error':              $configKey = 'HeistaAddressCheck.statusOnError';             break;
+            // 1.9.0, from statusBucket(), never from the platform directly.
+            case 'b2b_review': $configKey = 'HeistaAddressCheck.statusOnB2bReview'; break;
+            case 'b2b_mismatch':
+                // A merchant who sets only the review status gets it for a mismatch too,
+                // rather than an order that moves on towards shipping.
+                $configKey = trim((string) $this->config->get('HeistaAddressCheck.statusOnB2bMismatch')) !== ''
+                    ? 'HeistaAddressCheck.statusOnB2bMismatch'
+                    : 'HeistaAddressCheck.statusOnB2bReview';
+                break;
             default:                   return null;
         }
 
@@ -887,23 +1082,75 @@ class AddressCheckApplyService
 
     /**
      * Outcomes that would let the order continue to shipping. A phone the label would be
-     * refused for stops exactly these; every other outcome already lands in a status a
-     * human works through, and the comment names the phone problem there too.
+     * refused for stops exactly these, and so does a recipient or email result of the business
+     * customer check that needs a human (1.9.0); every other outcome already lands in a status
+     * a human works through, and the comment names the phone and recipient results there too.
      */
     private const OUTCOMES_THAT_SHIP = ['verified', 'corrected', 'review_suggested'];
 
     /**
-     * Returns the outcome whose configured status the order gets: 'error' when the phone
-     * needs a human and the address alone would have let the order ship, else the address
-     * outcome unchanged.
+     * Skip reasons that mean "the business customer check was not wanted for this order".
+     * They change no status: the merchant did not ask, or switched the check off.
+     */
+    private const RECIPIENT_SKIPS_WITHOUT_REVIEW = ['not_enabled', 'not_requested'];
+
+    /**
+     * Returns the outcome whose configured status the order gets, for an address result that
+     * would let the order ship:
+     *   - 'error' when the phone needs a human;
+     *   - else 'b2b_mismatch' when something other than the chosen kinds of recipient is
+     *     listed at the address;
+     *   - else 'b2b_review' when the recipient was not confirmed, or the order was placed
+     *     with a private email address (a confirmed recipient does not clear that, because
+     *     "real business, private mailbox" is exactly the fraud pattern);
+     *   - else the address outcome unchanged.
+     * Any other address outcome is returned unchanged.
      */
     private function statusBucket(string $outputStatus, array $output): string
     {
-        if ($this->phoneNeedsHuman($output) && in_array($outputStatus, self::OUTCOMES_THAT_SHIP, true)) {
+        if (!in_array($outputStatus, self::OUTCOMES_THAT_SHIP, true)) {
+            return $outputStatus;
+        }
+
+        if ($this->phoneNeedsHuman($output)) {
             return 'error';
         }
 
+        if ((string) ($output['recipientStatus'] ?? '') === 'mismatch') {
+            return 'b2b_mismatch';
+        }
+
+        if ($this->recipientNeedsReview($output) || $this->freemailNeedsReview($output)) {
+            return 'b2b_review';
+        }
+
         return $outputStatus;
+    }
+
+    /**
+     * True when the recipient part of the result needs a human: any result other than
+     * `verified`, except a skip that means the check was not wanted. Absent means the check
+     * did not run (add-on off, or a platform that predates it) and needs nothing.
+     */
+    private function recipientNeedsReview(array $output): bool
+    {
+        $status = (string) ($output['recipientStatus'] ?? '');
+        if ($status === '' || $status === 'verified') {
+            return false;
+        }
+
+        $reason = (string) ($output['recipientReason'] ?? '');
+        if ($status === 'skipped' && in_array($reason, self::RECIPIENT_SKIPS_WITHOUT_REVIEW, true)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /** True when the order was placed with an address of a private email provider. */
+    private function freemailNeedsReview(array $output): bool
+    {
+        return (string) ($output['freemailStatus'] ?? '') === 'freemail';
     }
 
     /**
