@@ -886,15 +886,20 @@ class AddressCheckSubmitService
      */
     private function notAttempted(SaasRequestException $seen, ?PendingAddressCheck $row): SaasRequestException
     {
-        $e = new SaasRequestException(
-            'not sent, platform unreachable earlier in this cron run: ' . $seen->getMessage(),
-            $seen->getHttpStatus(),
-            $seen->getRetryAfterSeconds(),
-            $seen->getErrorCode(),
-            $seen->platformAnswered()
-        );
-
-        return $e->withJobId($row !== null ? (string) $row->jobId : '');
+        // Plenty's validator refuses `new` everywhere except directly after `throw` ("clone or
+        // new are not allowed"), and this path runs only during an outage, so the exception is
+        // built by throwing it rather than through pluginApp()'s positional arguments.
+        try {
+            throw new SaasRequestException(
+                'not sent, platform unreachable earlier in this cron run: ' . $seen->getMessage(),
+                $seen->getHttpStatus(),
+                $seen->getRetryAfterSeconds(),
+                $seen->getErrorCode(),
+                $seen->platformAnswered()
+            );
+        } catch (SaasRequestException $e) {
+            return $e->withJobId($row !== null ? (string) $row->jobId : '');
+        }
     }
 
     /**
