@@ -787,6 +787,22 @@ class AddressCheckApplyService
     }
 
     /**
+     * Internal note when both actions failed at the same moment and the cron drops the plain
+     * retry in favour of the business customer one (1.9.0). Nothing was billed for the plain
+     * submit, so the note asks for exclusive filters and says nothing about charges.
+     *
+     * @param string $plainJobId a plain job created before its confirm failed, '' otherwise;
+     *                           it is never confirmed and the platform cancels it
+     */
+    public function writeRetrySetAsideNote(int $orderId, string $plainJobId): void
+    {
+        $this->writeStandaloneNote($orderId, $plainJobId,
+            'Übermittlung ohne Geschäftskundenprüfung nicht wiederholt: Der Auftrag wird mit Geschäftskundenprüfung übermittelt, Status und Adresse richten sich nach dieser Prüfung. '
+            . 'Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft.'
+        );
+    }
+
+    /**
      * Internal note when both actions submitted the order at the same moment (1.9.0): this
      * job's result is not used, the business customer job decides. With a dashboard setting
      * that already checks recipients on the plain action, the second flow is not needed at

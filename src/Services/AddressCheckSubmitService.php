@@ -224,6 +224,24 @@ class AddressCheckSubmitService
      */
     public function resubmit(PendingAddressCheck $row, ?SaasRequestException $platformDown = null): ?SaasRequestException
     {
+        // Both actions failed at the same moment and queued one row each (two flows on one
+        // trigger, parallel processes, p18857 2026-11-05). The cron runs the rows one after the
+        // other, so here the plain one can still give way: the flagged row is the one submit
+        // this order gets, and no second job is created or billed. Local only, no request.
+        if (!$this->rowRequestsB2bCheck($row)) {
+            $sibling = $this->pendingRepo->findB2bSibling($row, self::DUPLICATE_WINDOW_SECONDS);
+            if ($sibling !== null) {
+                $this->pendingRepo->markFailed($row, 'set aside: business customer row ' . (int) $sibling->id . ' of the same order goes instead');
+                $this->apply->writeRetrySetAsideNote((int) $row->orderId, (string) $row->jobId);
+                $this->report(__METHOD__, 'HeistaAddressCheck::log.retrySetAside', [
+                    'orderId'  => (int) $row->orderId,
+                    'jobId'    => (string) $row->jobId,
+                    'b2bRowId' => (int) $sibling->id,
+                ]);
+                return null;
+            }
+        }
+
         if ($platformDown !== null && time() - $this->firstAttemptAt($row) < $this->retryWindowSeconds()) {
             return $platformDown;
         }

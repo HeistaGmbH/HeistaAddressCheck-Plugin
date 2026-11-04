@@ -228,7 +228,11 @@ job's result arrives, `apply()` finds the business customer row of the same orde
 within ten minutes and sets the plain result aside, whichever arrives first: no
 address write, no status, a comment that names both jobs. If the plain result
 carries a recipient verdict, the dashboard setting is "Orders with a company name"
-or "Every order", and the comment says the second flow is not needed at all.
+or "Every order", and the comment says the second flow is not needed at all. When
+both parallel submits fail and each queues a retry row, the cron, which runs the
+rows one after the other, closes the plain row without a request (`retrySetAside`,
+a comment on the order) and only the business customer row is sent, so that order
+is checked and charged once.
 
 Results land in the internal order comment as a "Geschäftskundenprüfung" and an
 "E-Mail-Prüfung" line. A result that needs a human moves an order whose address
