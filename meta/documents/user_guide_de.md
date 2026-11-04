@@ -46,10 +46,13 @@ Das Plugin bringt zwei Aktionen mit. Die Flows, die sie ausführen, legen Sie se
 2. Flow 1 beim Anlegen eines Auftrags, mit einem Filter auf Ihre Geschäftskundenaufträge, etwa eine Zahlungsart wie Rechnung, eine Kundenklasse oder ein Tag. Aktion: ***SubmitAddressCheckB2b → Adresse via Heista SaaS prüfen, mit Geschäftskundenprüfung***.
 3. Flow 2 mit demselben Auslöser und dem umgekehrten Filter: alle anderen Zahlungsarten, alle anderen Kundenklassen oder ohne den Tag. Aktion: ***SubmitAddressCheck → Adresse via Heista SaaS prüfen***.
 
-Die Filter der beiden Flows müssen sich gegenseitig ausschließen, jeder Auftrag soll genau einen der beiden durchlaufen. Passt ein Auftrag doch auf beide, übermittelt das Plugin ihn trotzdem nur einmal:
+Die Filter der beiden Flows müssen sich gegenseitig ausschließen, jeder Auftrag soll genau einen der beiden durchlaufen. Passt ein Auftrag doch auf beide, gilt:
 
 - Kam die Aktion mit Geschäftskundenprüfung zuerst, wird die zweite Übermittlung verworfen. Der Auftrag bekommt die vollständige Prüfung.
 - Kam die normale Aktion zuerst und ist schon bei Heista angekommen, startet keine Geschäftskundenprüfung. Der Auftrag bekommt einen internen Kommentar: „Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft.“ Korrigieren Sie dann die Filter. Für diesen Auftrag können Sie die Aktion frühestens zehn Minuten später erneut ausführen.
+- Starten beide Flows im selben Moment, was plentyONE bei einem gemeinsamen Auslöser tun kann, wird der Auftrag zweimal geprüft und zweimal berechnet. Status und Adresse richten sich dann nur nach der Prüfung mit Geschäftskundenprüfung, egal welches Ergebnis zuerst ankommt. Das andere Ergebnis wird nicht übernommen, der Auftrag bekommt dazu einen internen Kommentar.
+
+Steht im Heista-Dashboard „Bestellungen mit Firmenname“ oder „Alle Bestellungen“, prüft schon die normale Aktion die Empfänger. Dann brauchen Sie die Aktion mit Geschäftskundenprüfung nicht, ein Flow nach Rezept A genügt. Ein zweiter Flow mit derselben Aktion führt nur dazu, dass Aufträge doppelt geprüft und berechnet werden.
 
 Dieselbe Aktion zweimal auszuführen verhält sich wie bisher.
 

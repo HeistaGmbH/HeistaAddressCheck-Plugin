@@ -46,10 +46,13 @@ The plugin brings two actions. You create the flows that run them yourself.
 2. Flow 1 on order creation, filtered to your business orders, such as a payment method like invoice, a customer class or a tag. Action: ***SubmitAddressCheckB2b → Validate address via Heista SaaS, with business customer check***.
 3. Flow 2 with the same trigger and the opposite filter: all other payment methods, all other customer classes, or without the tag. Action: ***SubmitAddressCheck → Validate address via Heista SaaS***.
 
-The filters of the two flows must exclude each other, so that every order goes through exactly one of them. If an order matches both anyway, the plugin still submits it only once:
+The filters of the two flows must exclude each other, so that every order goes through exactly one of them. If an order matches both anyway:
 
 - If the action with the business customer check came first, the second submit is dropped. The order gets the full check.
 - If the plain action came first and has already reached Heista, no business customer check is started. The order gets an internal comment in German: "Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft." (the filters of your two automations overlap). Fix the filters then. For that order you can run the action again ten minutes later at the earliest.
+- If both flows start at the same moment, which plentyONE can do on a shared trigger, the order is checked twice and charged twice. Status and address then follow the check with the business customer check only, whichever result arrives first. The other result is not used, and the order gets an internal comment saying so.
+
+With "Orders with a company name" or "Every order" in the Heista dashboard, the plain action already checks recipients. You do not need the action with the business customer check then; one flow as in recipe A is enough. A second flow with that action only gets orders checked and charged twice.
 
 Running the same action twice behaves as before.
 

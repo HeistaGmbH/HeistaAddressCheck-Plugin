@@ -213,13 +213,22 @@ everything else and runs the plain action. The dashboard is set to "Only orders
 from the plugin action with business customer check".
 
 The two filters must exclude each other. If an order matches both anyway, the
-plugin sends it once, never twice, and the business customer check wins: a plain
-submit within ten minutes of a business customer submit for the same order is
-dropped, and a queued plain submit is upgraded. If the plain submit already
-reached the platform, the business customer check is not started and the order
-gets an internal comment: "Die Filter Ihrer beiden Automatisierungen überschneiden
-sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft." Running the same action
+business customer check wins: a plain submit within ten minutes of a business
+customer submit for the same order is dropped, and a queued plain submit without
+a job id is upgraded. If the plain submit already reached the platform, the
+business customer check is not started and the order gets an internal comment:
+"Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so
+einstellen, dass jeder Auftrag nur eine davon durchläuft." Running the same action
 twice behaves exactly as before.
+
+The guard cannot stop two flows that start at the same moment: plentyONE ran
+both on one trigger from parallel processes, 0.3 ms apart, before either had a
+queue row to find. Such an order is checked and charged twice. When the plain
+job's result arrives, `apply()` finds the business customer row of the same order
+within ten minutes and sets the plain result aside, whichever arrives first: no
+address write, no status, a comment that names both jobs. If the plain result
+carries a recipient verdict, the dashboard setting is "Orders with a company name"
+or "Every order", and the comment says the second flow is not needed at all.
 
 Results land in the internal order comment as a "Geschäftskundenprüfung" and an
 "E-Mail-Prüfung" line. A result that needs a human moves an order whose address

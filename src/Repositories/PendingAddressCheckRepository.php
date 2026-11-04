@@ -65,6 +65,36 @@ class PendingAddressCheckRepository
     }
 
     /**
+     * Another row of the same order, submitted through the business customer action within
+     * $windowSeconds of $row's first submit, or null. Two flows on one event can submit an
+     * order from parallel processes before either has a row for the duplicate guard to find
+     * (p18857, 2026-11-04: two creates 0.3 ms apart), and apply() reads this to let the
+     * flagged job decide the order. Filtered in PHP: the flag is a boolean column and an
+     * order has a handful of rows at most.
+     */
+    public function findB2bSibling(PendingAddressCheck $row, int $windowSeconds): ?PendingAddressCheck
+    {
+        $at = strtotime((string) $row->submittedAt);
+        if ($at === false) {
+            return null;
+        }
+
+        $rows = $this->db->query(PendingAddressCheck::class)
+            ->where('orderId', '=', (int) $row->orderId)
+            ->where('submittedAt', '>=', date('Y-m-d H:i:s', $at - $windowSeconds))
+            ->where('submittedAt', '<=', date('Y-m-d H:i:s', $at + $windowSeconds))
+            ->get();
+
+        foreach ($rows as $candidate) {
+            if ((int) $candidate->id !== (int) $row->id && filter_var($candidate->b2bCheck, FILTER_VALIDATE_BOOLEAN)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * A queued plain submit is upgraded when the business customer procedure fires for
      * the same order: the one job that results carries the flag, and every later
      * retry of the row sends it again. Only for a row without a job id: a row that has

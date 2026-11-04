@@ -69,7 +69,7 @@ class AddressCheckSubmitService
      * re-run after fixing an address comes minutes to hours later. A constant, not a config
      * key, because nobody has a reason to tune it.
      */
-    private const DUPLICATE_WINDOW_SECONDS = 600;
+    private const DUPLICATE_WINDOW_SECONDS = PendingAddressCheck::DUPLICATE_WINDOW_SECONDS;
 
     public function __construct(
         SaasClient $saasClient,

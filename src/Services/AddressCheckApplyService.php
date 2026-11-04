@@ -82,6 +82,18 @@ class AddressCheckApplyService
             return;
         }
 
+        // Two flows on one event can submit the same order from parallel processes, one
+        // through each action, before either has a row the duplicate guard could find. The
+        // order then ends as if only the business customer action had run: its job decides
+        // status and address, whichever result arrives first, and this one leaves a note.
+        if (!filter_var($row->b2bCheck, FILTER_VALIDATE_BOOLEAN)) {
+            $sibling = $this->pendingRepo->findB2bSibling($row, PendingAddressCheck::DUPLICATE_WINDOW_SECONDS);
+            if ($sibling !== null) {
+                $this->setAsideForB2bSibling($row, $sibling, $jobId, $body);
+                return;
+            }
+        }
+
         $jobStatus = (string) ($body['status'] ?? '');
         $item      = $body['items'][0] ?? null;
         $orderId   = (int) $row->orderId;
@@ -228,6 +240,48 @@ class AddressCheckApplyService
         }
 
         $this->pendingRepo->markFailed($row, 'Address output status: ' . $outputStatus . ' (isValid=' . ($isValid ? '1' : '0') . ')');
+    }
+
+    /**
+     * Closes a plain row whose order was also submitted through the business customer
+     * action in parallel: no address write, no status, only a note on the order. The row is
+     * FAILED with the reason, so neither the cron nor a late callback picks it up again.
+     */
+    private function setAsideForB2bSibling(PendingAddressCheck $row, PendingAddressCheck $sibling, string $jobId, array $body): void
+    {
+        $orderId = (int) $row->orderId;
+        $output  = $body['items'][0]['output'] ?? null;
+
+        $this->writeParallelOverlapNote(
+            $orderId,
+            $jobId,
+            (string) $sibling->jobId,
+            is_array($output) && $this->carriesRecipientVerdict($output)
+        );
+        $this->pendingRepo->markFailed($row, 'set aside: submitted in parallel with business customer job ' . (string) $sibling->jobId);
+
+        $this->report(__METHOD__, 'HeistaAddressCheck::log.resultSetAside', [
+            'orderId'  => $orderId,
+            'jobId'    => $jobId,
+            'b2bJobId' => (string) $sibling->jobId,
+        ]);
+    }
+
+    /**
+     * Whether a result carries a business customer verdict although it came from the plain
+     * action. The platform writes the recipient fields into every job of a tenant whose
+     * dashboard setting is "Bestellungen mit Firmenname" or "Alle Bestellungen", and into
+     * none otherwise, so this tells the overlap note which advice fits.
+     */
+    private function carriesRecipientVerdict(array $output): bool
+    {
+        $status = (string) ($output['recipientStatus'] ?? '');
+        if ($status === '') {
+            return false;
+        }
+
+        return !($status === 'skipped'
+            && in_array((string) ($output['recipientReason'] ?? ''), self::RECIPIENT_SKIPS_WITHOUT_REVIEW, true));
     }
 
     /**
@@ -730,6 +784,27 @@ class AddressCheckApplyService
             . ($earlierJobId !== '' ? ' (Job ' . $earlierJobId . ')' : '')
             . '. Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft.'
         );
+    }
+
+    /**
+     * Internal note when both actions submitted the order at the same moment (1.9.0): this
+     * job's result is not used, the business customer job decides. With a dashboard setting
+     * that already checks recipients on the plain action, the second flow is not needed at
+     * all, and the note says so instead of asking for exclusive filters.
+     *
+     * @param string $b2bJobId the business customer job, '' when it has not reached the platform
+     */
+    private function writeParallelOverlapNote(int $orderId, string $jobId, string $b2bJobId, bool $plainActionChecksRecipients): void
+    {
+        $text = 'Ergebnis von Job ' . $jobId . ' nicht übernommen: Der Auftrag wurde gleichzeitig auch mit Geschäftskundenprüfung übermittelt'
+            . ($b2bJobId !== '' ? ' (Job ' . $b2bJobId . ')' : '')
+            . '. Status und Adresse richten sich nach dieser Prüfung. ';
+
+        $text .= $plainActionChecksRecipients
+            ? 'Bei Ihrer Einstellung im Heista-Dashboard prüft schon die normale Aktion die Empfänger, die Aktion mit Geschäftskundenprüfung brauchen Sie dafür nicht. Nehmen Sie einen der beiden Flows heraus, sonst wird jeder Auftrag zweimal geprüft und zweimal berechnet.'
+            : 'Die Filter Ihrer beiden Automatisierungen überschneiden sich, deshalb wurde der Auftrag zweimal geprüft und zweimal berechnet. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft.';
+
+        $this->writeStandaloneNote($orderId, $jobId, $text);
     }
 
     /**

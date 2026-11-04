@@ -32,6 +32,13 @@ class PendingAddressCheck extends Model
      */
     const STATUS_RETRY   = 'RETRY';
 
+    /**
+     * How close two submits of one order must be to count as the same event firing both
+     * actions (1.9.0). Read by the duplicate guard at submit and by apply() for the
+     * parallel case the guard cannot see.
+     */
+    const DUPLICATE_WINDOW_SECONDS = 600;
+
     public $id                = 0;
     public $orderId           = 0;
     public $jobId             = '';
