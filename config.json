@@ -156,6 +156,23 @@
             "tooltip": "Config.skipSalesOrdersWithDeliveryOrdersTooltip",
             "defaultValue": false
           }
+        },
+        "retryWindowHours": {
+          "type": "selectBox",
+          "required": false,
+          "label": "Config.retryWindowHoursLabel",
+          "options": {
+            "tooltip": "Config.retryWindowHoursTooltip",
+            "defaultValue": "8",
+            "selectBoxValues": [
+              { "value": "1",  "caption": "Config.retryWindowHours1" },
+              { "value": "2",  "caption": "Config.retryWindowHours2" },
+              { "value": "4",  "caption": "Config.retryWindowHours4" },
+              { "value": "8",  "caption": "Config.retryWindowHours8" },
+              { "value": "12", "caption": "Config.retryWindowHours12" },
+              { "value": "24", "caption": "Config.retryWindowHours24" }
+            ]
+          }
         }
       }
     },

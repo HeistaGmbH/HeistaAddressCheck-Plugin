@@ -11,6 +11,14 @@ Das Plugin schickt die Lieferadresse eines Auftrags an die Heista-Adressprüfung
 
 Arbeiten Sie noch mit klassischen Ereignisaktionen (***Einrichtung → Aufträge → Ereignisaktionen***), finden Sie dort dieselben zwei Prozeduren unter denselben Namen.
 
+## Wenn Heista nicht erreichbar ist
+
+Erreicht das Plugin Heista nicht, bleibt der Auftrag in seinem Status, und das Plugin versucht es nach 5 Minuten erneut, danach in wachsenden Abständen bis zu einer Stunde. Das gilt ab Version 1.9.0 auch, wenn statt Heista eine Fehlerseite antwortet, etwa „404 page not found“. Beim ersten Fehlversuch bekommt der Auftrag einen internen Kommentar: noch nicht geprüft, und bis wann das Plugin es weiter versucht.
+
+Wie lange das Plugin es versucht, stellen Sie im Bereich ***Auftragsbehandlung*** unter ***Wartezeit, wenn Heista nicht erreichbar ist*** ein, von 1 bis 24 Stunden. Voreingestellt sind 8 Stunden, damit ein nächtlicher Ausfall bis zum Morgen von selbst erledigt ist. Wer am selben Tag versendet, wählt eine kürzere Zeit. Ist Heista nach dieser Zeit noch immer nicht erreichbar, geht der Auftrag beim nächsten Versuch in den Fehlerstatus, spätestens rund eine Stunde danach. Er bekommt einen internen Kommentar mit der Zahl der Versuche und der letzten Ursache. Danach führen Sie die Ereignisaktion erneut aus.
+
+Lehnt Heista die Prüfung dagegen ab, etwa wegen eines ungültigen API-Schlüssels oder zu wenig Guthaben, geht der Auftrag sofort in den Fehlerstatus, und der Kommentar sagt, was Sie ändern müssen.
+
 ## Geschäftskundenprüfung (ab Version 1.9.0)
 
 Für Shops, die an Unternehmen, Schulen, Kitas, Behörden und andere Einrichtungen liefern. Zusätzlich zur Adressprüfung gibt es zwei Prüfungen, die Sie einzeln einschalten:

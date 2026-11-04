@@ -725,18 +725,42 @@ class AddressCheckApplyService
      */
     public function writeB2bOverlapNote(int $orderId, string $earlierJobId): void
     {
+        $this->writeStandaloneNote($orderId, $earlierJobId,
+            'Geschäftskundenprüfung nicht gestartet: Der Adresscheck für diesen Auftrag läuft bereits ohne Geschäftskundenprüfung'
+            . ($earlierJobId !== '' ? ' (Job ' . $earlierJobId . ')' : '')
+            . '. Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft.'
+        );
+    }
+
+    /**
+     * Internal note on the first failed submit attempt (1.9.0): Heista is out of reach,
+     * the plugin keeps trying, and the order keeps its status until $until (d.m.Y H:i,
+     * the end of the configured retry window). Without it the order sat in its status
+     * with nothing on it for the whole window. Changes no status; soft-fail.
+     */
+    public function writeSubmitDeferredNote(int $orderId, string $until): void
+    {
+        $this->writeStandaloneNote($orderId, '',
+            'Noch nicht geprüft: Heista ist gerade nicht erreichbar. Das Plugin versucht es automatisch weiter, der Auftragsstatus bleibt so lange unverändert. '
+            . 'Gelingt die Übermittlung bis ' . $until . ' nicht, geht der Auftrag in den Fehlerstatus.'
+        );
+    }
+
+    /**
+     * A note that belongs to no result block, so it carries no address snapshot.
+     * Changes no status. Soft-fail like every comment: never throws into the caller.
+     */
+    private function writeStandaloneNote(int $orderId, string $jobId, string $text): void
+    {
         $authorUserId = $this->resolveCommentAuthorUserId();
         if ($authorUserId === null) {
             $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentSkippedNoUser', [
-                'jobId'   => $earlierJobId,
+                'jobId'   => $jobId,
                 'orderId' => $orderId,
             ]);
             return;
         }
 
-        $text = 'Geschäftskundenprüfung nicht gestartet: Der Adresscheck für diesen Auftrag läuft bereits ohne Geschäftskundenprüfung'
-              . ($earlierJobId !== '' ? ' (Job ' . $earlierJobId . ')' : '')
-              . '. Die Filter Ihrer beiden Automatisierungen überschneiden sich. Bitte so einstellen, dass jeder Auftrag nur eine davon durchläuft.';
         $html = '<p><strong>Heista Adressprüfung</strong><br>'
               . htmlspecialchars($text, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</p>';
 
@@ -745,7 +769,7 @@ class AddressCheckApplyService
                 return $this->createComment($orderId, $html, $authorUserId);
             });
             $this->report(__METHOD__, 'HeistaAddressCheck::log.commentCreated', [
-                'jobId'     => $earlierJobId,
+                'jobId'     => $jobId,
                 'orderId'   => $orderId,
                 'commentId' => $commentId,
                 'userId'    => $authorUserId,
@@ -753,7 +777,7 @@ class AddressCheckApplyService
             ]);
         } catch (Throwable $e) {
             $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.commentCreateFailed', [
-                'jobId'   => $earlierJobId,
+                'jobId'   => $jobId,
                 'orderId' => $orderId,
                 'userId'  => $authorUserId,
                 'error'   => $e->getMessage(),

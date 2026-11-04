@@ -28,7 +28,26 @@ class SaasClient
     const CLIENT_NAME    = 'HeistaAddressCheck';
     const CLIENT_VERSION = '1.9.0';
 
+    /**
+     * Create and confirm in one go. A failed confirm carries the created job's id
+     * (SaasRequestException::getJobId), so the retry can confirm that job instead
+     * of creating a second one that the merchant might pay for twice.
+     */
     public function submitJob(string $baseUrl, string $apiKey, array $body, int $connectTimeoutMs = 5000): string
+    {
+        $jobId = $this->createJob($baseUrl, $apiKey, $body, $connectTimeoutMs);
+
+        try {
+            $this->confirmJob($baseUrl, $apiKey, $jobId, $connectTimeoutMs);
+        } catch (SaasRequestException $e) {
+            throw $e->withJobId($jobId);
+        }
+
+        return $jobId;
+    }
+
+    /** Returns the id of the created job, which waits for its confirm for 30 minutes. */
+    public function createJob(string $baseUrl, string $apiKey, array $body, int $connectTimeoutMs = 5000): string
     {
         $created = $this->request('POST', rtrim($baseUrl, '/') . '/api/v1/jobs', $apiKey, $body, $connectTimeoutMs);
 
@@ -37,10 +56,22 @@ class SaasClient
             throw new RuntimeException('SaaS submit response missing jobId');
         }
 
-        $confirmUrl = rtrim($baseUrl, '/') . '/api/v1/jobs/' . rawurlencode($jobId) . '/confirm';
-        $this->request('POST', $confirmUrl, $apiKey, null, $connectTimeoutMs);
-
         return $jobId;
+    }
+
+    /**
+     * Returns the job's status after the confirm ('' when the answer named none).
+     * Since 2026-11-04 the platform answers a repeated confirm of an already
+     * confirmed job with 200 and its current status and charges nothing, so
+     * calling this again after a lost response is safe.
+     */
+    public function confirmJob(string $baseUrl, string $apiKey, string $jobId, int $connectTimeoutMs = 5000): string
+    {
+        $confirmUrl = rtrim($baseUrl, '/') . '/api/v1/jobs/' . rawurlencode($jobId) . '/confirm';
+        $confirmed  = $this->request('POST', $confirmUrl, $apiKey, null, $connectTimeoutMs);
+        $status     = $confirmed['status'] ?? '';
+
+        return is_string($status) ? $status : '';
     }
 
     public function pollJob(string $baseUrl, string $apiKey, string $jobId, int $connectTimeoutMs = 5000): array
@@ -110,7 +141,8 @@ class SaasClient
                 sprintf('HTTP %s %s returned %d: %s', $method, $url, $status, substr($rawBody, 0, 500)),
                 $status,
                 self::retryAfterSeconds($rawHeaders, $decoded),
-                (string) ($decoded['error']['code'] ?? '')
+                self::errorCode($decoded),
+                self::platformAnswered($status, $decoded)
             );
         }
 
@@ -137,8 +169,46 @@ class SaasClient
             return (int) $match[1];
         }
 
-        $fromBody = $decodedBody['error']['details']['retryAfterSeconds'] ?? null;
+        $fromBody = $decodedBody['data']['error']['details']['retryAfterSeconds']
+            ?? $decodedBody['error']['details']['retryAfterSeconds']
+            ?? null;
 
         return is_numeric($fromBody) ? (int) $fromBody : 0;
+    }
+
+    /**
+     * The platform's error code, '' when the body has none. The platform wraps every
+     * error in its framework's envelope and puts the code under data.error.code:
+     *
+     *   {"error":true,"statusCode":404,"message":"","data":{"error":{"code":"NOT_FOUND",...}}}
+     *
+     * Plugins up to 1.8.0 read error.code at the top level, where the envelope has
+     * `true`, so they never saw a code (measured on staging 2026-11-04). The top-level
+     * form is still read in case the platform ever drops the envelope.
+     */
+    public static function errorCode(array $decodedBody): string
+    {
+        $code = $decodedBody['data']['error']['code'] ?? $decodedBody['error']['code'] ?? '';
+
+        return is_string($code) ? $code : '';
+    }
+
+    /**
+     * True when an error body came from the platform itself and not from a proxy, CDN or
+     * WAF in front of it. The platform's envelope always repeats the HTTP status as
+     * `statusCode`; its v1 refusals also carry data.error.code. Its auth layer answers a
+     * bad key with the envelope and no code, so the envelope alone has to count, or a
+     * revoked key would be retried for hours. A proxy's own answer is text/plain
+     * ("404 page not found"), a WAF's is HTML, and neither decodes to such an object.
+     */
+    public static function platformAnswered(int $status, array $decodedBody): bool
+    {
+        if (self::errorCode($decodedBody) !== '') {
+            return true;
+        }
+
+        return isset($decodedBody['statusCode'])
+            && is_numeric($decodedBody['statusCode'])
+            && (int) $decodedBody['statusCode'] === $status;
     }
 }

@@ -11,6 +11,14 @@ The plugin sends an order's delivery address to the Heista address check and wri
 
 If you still work with classic event procedures (***Setup → Orders → Event procedures***), you will find the same two procedures there under the same names.
 
+## When Heista cannot be reached
+
+If the plugin cannot reach Heista, the order keeps its status and the plugin tries again after 5 minutes, then at growing intervals of up to an hour. Since version 1.9.0 this also applies when an error page answers instead of Heista, such as "404 page not found". On the first failed attempt the order gets an internal comment saying it is not checked yet and until when the plugin keeps trying.
+
+You set how long the plugin keeps trying in the ***Order handling*** section under ***Waiting time while Heista cannot be reached***, from 1 to 24 hours. The default is 8 hours, so an outage overnight is dealt with by the morning. If you ship the same day, pick a shorter time. If Heista is still unreachable after that time, the order moves to the error status at the next attempt, at most about an hour later, with an internal comment that names the number of attempts and the last cause. Then run the event procedure again.
+
+If Heista refuses the check, for example because the API key is invalid or the balance is too low, the order moves to the error status at once, and the comment says what to change.
+
 ## Business customer check (since version 1.9.0)
 
 For shops that deliver to companies, schools, Kitas, public authorities and other organisations. On top of the address check there are two checks, each switched on separately:

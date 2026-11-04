@@ -61,7 +61,7 @@ unreachable), the cron-poll fallback still applies corrections.
 | `undeliverable` | no | Address not found — or not confirmable. Includes `reason: address_conflict`: the postal code / city could not be confirmed and the same street was found in a *different* postal area, so the address was deliberately **not** changed and the alternative is posted as an **Adress-Vorschlag** in the order comment | contact customer / fix manually |
 | `postnumber_invalid` | no | Packstation/Postfiliale post number invalid | request a valid post number |
 | `email_required` | no | Carrier needs an email and none is present (e.g. DPD) | request an email from the customer |
-| `error` | no | Check failed (no result / timeout), the platform refused the submit (API key, balance, DHL credentials), or it stayed unreachable for 24 hours. The comment says which | retry, or fix what the comment names — not the customer's fault |
+| `error` | no | Check failed (no result / timeout), the platform refused the submit (API key, balance, DHL credentials), or it stayed unreachable for the configured waiting time. The comment says which | retry, or fix what the comment names — not the customer's fault |
 | `error` (phone) | yes | The address passed, but DHL would refuse the label for the phone number (see below) | fix the phone number in the delivery address |
 | business customer review | yes | The address passed, but the recipient was not confirmed or not found, could not be checked, or the order was placed with a private email address (see below) | check by hand as before, the comment names the reason |
 | business customer mismatch | yes | The address passed, but something other than the chosen kinds of recipient is listed there | check by hand, the recipient is likely not who the order claims |
@@ -115,11 +115,40 @@ A submit that fails because the platform did not answer, answered with a 5xx or
 asked the plugin to wait (429) is queued and retried by the five-minute cron:
 after 5 minutes, then at doubling intervals up to an hour, and a `Retry-After`
 from the platform is honoured as given. The order keeps its status meanwhile,
-because nothing is known about the address yet. After 24 hours the plugin
-stops, moves the order to `statusOnError` and posts an internal comment naming
-the attempts and the last cause, so an unchecked order never looks like a
+because nothing is known about the address yet. After the waiting time the
+plugin stops, moves the order to `statusOnError` and posts an internal comment
+naming the attempts and the last cause, so an unchecked order never looks like a
 checked one. Re-running the event action on a queued order submits it at once
 instead of opening a second queue entry.
+
+The waiting time is the setting `retryWindowHours` under *Order handling* since
+1.9.0: 1, 2, 4, 8, 12 or 24 hours, 8 by default (24 hours fixed before). The
+attempt that finds it used up gives up, so with the cadence above the order
+reaches `statusOnError` up to about an hour after it. The first failed attempt also
+posts an internal comment saying the order is not checked yet and until when the
+plugin keeps trying, so a waiting order is visible on the order itself.
+
+Once a cron run finds the platform out of reach, it sends nothing more in that
+run (1.9.0). A platform that accepts connections and never answers costs 15
+seconds per request, and 50 polls plus 100 resubmits would otherwise hold one
+run for over half an hour. The remaining queued orders are still looked at:
+those past their waiting time go to `statusOnError` with the comment, the
+others stay due for the next run.
+
+Since 1.9.0 two more cases are retried the same way. A 4xx whose body is not the
+platform's own error envelope (a proxy's `404 page not found`, a WAF's HTML page)
+counts as unreachable, because the platform never decided anything: on
+2026-11-03 the proxy in front of the platform answered every request itself for
+20 minutes, and 1.8.0 sent those orders to `statusOnError`. And when the job was created but its confirm
+failed, the queue row keeps the job id, and the retry confirms that job instead
+of creating another. The platform answers a repeated confirm with 200 and charges
+nothing, so a confirm whose response was lost is not paid twice. When the
+platform answers that the job is gone (cancelled after 30 minutes unconfirmed, or
+unknown to this key), the same attempt creates a new one.
+
+A job whose result arrives by the five-minute poll with status `FAILED` now gets
+the same note and `statusOnError` as one that arrives by callback; until 1.9.0
+the poll only closed the queue row.
 
 A refusal that no retry can fix (invalid API key, empty wallet, invalid DHL
 credentials, a request the platform rejects) goes to `statusOnError`

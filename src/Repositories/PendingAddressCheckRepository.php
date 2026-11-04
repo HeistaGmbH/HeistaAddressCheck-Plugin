@@ -67,7 +67,9 @@ class PendingAddressCheckRepository
     /**
      * A queued plain submit is upgraded when the business customer procedure fires for
      * the same order: the one job that results carries the flag, and every later
-     * retry of the row sends it again.
+     * retry of the row sends it again. Only for a row without a job id: a row that has
+     * one stands for a plain job already created (1.9.0), and the caller writes the
+     * overlap note instead.
      */
     public function markB2bRequested(PendingAddressCheck $row): PendingAddressCheck
     {
@@ -102,11 +104,15 @@ class PendingAddressCheckRepository
             ->get();
     }
 
-    /** Park the row for another attempt at nextAttemptAt. submittedAt keeps the first attempt. */
-    public function scheduleRetry(PendingAddressCheck $row, int $attempts, string $nextAttemptAt, string $error): PendingAddressCheck
+    /**
+     * Park the row for another attempt at nextAttemptAt. submittedAt keeps the first attempt.
+     * $jobId is a created job whose confirm failed (1.9.0), so the next attempt confirms it
+     * rather than creating a second one; '' when the next attempt has to create.
+     */
+    public function scheduleRetry(PendingAddressCheck $row, int $attempts, string $nextAttemptAt, string $error, string $jobId): PendingAddressCheck
     {
         $row->status        = PendingAddressCheck::STATUS_RETRY;
-        $row->jobId         = '';
+        $row->jobId         = $jobId;
         $row->attempts      = $attempts;
         $row->nextAttemptAt = $nextAttemptAt;
         $row->lastError     = substr($error, 0, 1000);

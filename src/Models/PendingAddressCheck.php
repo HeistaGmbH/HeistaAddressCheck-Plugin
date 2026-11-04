@@ -25,8 +25,10 @@ class PendingAddressCheck extends Model
     const STATUS_FAILED  = 'FAILED';
     /**
      * The submit did not reach the platform (or it asked us to wait) and the
-     * cron will try again at nextAttemptAt. No jobId yet. Terminal states are
-     * PENDING (submitted), FAILED (given up or refused).
+     * cron will try again at nextAttemptAt. Usually no jobId; since 1.9.0 a row
+     * whose create went through and whose confirm failed keeps the job's id, and
+     * the next attempt confirms that job. Terminal states are PENDING
+     * (submitted), FAILED (given up or refused).
      */
     const STATUS_RETRY   = 'RETRY';
 

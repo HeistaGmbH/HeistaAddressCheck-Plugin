@@ -45,14 +45,20 @@ class AddressCheckSubmitService
      * Retry cadence for a submit that could not reach the platform (1.8.0).
      * The first retry comes with the next cron tick (5 minutes), then the gap
      * doubles up to an hour, and a Retry-After from the platform overrides the
-     * gap. After RETRY_WINDOW_SECONDS since the first attempt the plugin stops
-     * and tells the merchant, so no order waits forever without anyone knowing.
-     * 24 hours covers a platform-side interruption of several hours with room
-     * to spare; a weekend one may take longer, and then the note says so.
+     * gap. After the retry window since the first attempt the plugin stops and
+     * tells the merchant, so no order waits forever without anyone knowing.
+     *
+     * The window is the merchant's choice since 1.9.0 (config retryWindowHours,
+     * 24 hours fixed before): a shop that ships the same day wants the order in
+     * the error status soon, others would rather have it checked by itself once
+     * the platform is back. 8 hours by default, because our outages so far fell
+     * on a Sunday evening (6 hours, 2026-10-18) and at night (2026-11-03), and
+     * 8 hours get such an order checked before the morning shift.
      */
-    private const RETRY_WINDOW_SECONDS     = 24 * 3600;
-    private const RETRY_BASE_DELAY_SECONDS = 300;
-    private const RETRY_MAX_DELAY_SECONDS  = 3600;
+    private const RETRY_WINDOW_HOURS_ALLOWED = [1, 2, 4, 8, 12, 24];
+    private const RETRY_WINDOW_HOURS_DEFAULT = 8;
+    private const RETRY_BASE_DELAY_SECONDS   = 300;
+    private const RETRY_MAX_DELAY_SECONDS    = 3600;
 
     /**
      * Duplicate guard (1.9.0). Plenty runs every event action whose filter matches, so a
@@ -108,6 +114,11 @@ class AddressCheckSubmitService
      * flag afterwards. The same procedure twice behaves exactly as 1.8.0, so a
      * merchant with one procedure never meets the guard. The cron path
      * (resubmit) never comes through here, so a queued row cannot block itself.
+     *
+     * A RETRY row that carries a job id (its create went through, its confirm did
+     * not) counts as submitted: that job exists without the flag, so the business
+     * customer request gets the note instead of an upgrade, exactly as for a row
+     * already waiting for its result.
      */
     public function submitForOrder(Order $order, array $options = []): void
     {
@@ -125,7 +136,7 @@ class AddressCheckSubmitService
                 return;
             }
 
-            if ($recent->status === PendingAddressCheck::STATUS_RETRY) {
+            if ($recent->status === PendingAddressCheck::STATUS_RETRY && (string) $recent->jobId === '') {
                 $recent = $this->pendingRepo->markB2bRequested($recent);
                 $this->report(__METHOD__, 'HeistaAddressCheck::log.duplicateSubmitUpgraded', [
                     'orderId' => $orderId,
@@ -148,11 +159,25 @@ class AddressCheckSubmitService
         // A RETRY row older than the window, from the other procedure: the row is still the
         // one submit this order gets, so it carries the business customer check if either side
         // asked for it. Never reached when both sides are the same procedure, which is the
-        // only case 1.8.0 knew.
+        // only case 1.8.0 knew. A row that carries a job id is not upgraded: that job exists
+        // without the flag and may already be confirmed, so creating a flagged one could
+        // bill the order twice. The merchant gets the note instead, and the row is attempted
+        // as it is.
         if ($retryRow !== null && $requested && !$this->rowRequestsB2bCheck($retryRow)) {
-            $retryRow = $this->pendingRepo->markB2bRequested($retryRow);
+            if ((string) $retryRow->jobId === '') {
+                $retryRow = $this->pendingRepo->markB2bRequested($retryRow);
+            } else {
+                $this->report(__METHOD__, 'HeistaAddressCheck::log.duplicateSubmitNoted', [
+                    'orderId' => $orderId,
+                    'jobId'   => (string) $retryRow->jobId,
+                    'status'  => (string) $retryRow->status,
+                ]);
+                $this->apply->writeB2bOverlapNote($orderId, (string) $retryRow->jobId);
+            }
         }
-        $b2b = $requested || ($retryRow !== null && $this->rowRequestsB2bCheck($retryRow));
+        $b2b = $retryRow !== null && (string) $retryRow->jobId !== ''
+            ? $this->rowRequestsB2bCheck($retryRow)
+            : $requested || ($retryRow !== null && $this->rowRequestsB2bCheck($retryRow));
 
         $this->attempt($order, $retryRow, ['b2bCheck' => $b2b]);
     }
@@ -189,9 +214,20 @@ class AddressCheckSubmitService
      * passed. Loads the order itself; the event that carried it is long gone.
      * A row whose order cannot be loaded is closed without a status write: there
      * is no order to write to.
+     *
+     * Returns the failure when the platform could not be reached (1.9.0), null
+     * otherwise. The cron passes it back in as $platformDown for the rest of the
+     * run: such a row is not requested, so one run does not wait out a timeout per
+     * queued row. A row whose retry window has run out is still closed with the
+     * note and the error status, so the window holds however long the outage is;
+     * any other row stays due as it is and comes up in the next run.
      */
-    public function resubmit(PendingAddressCheck $row): void
+    public function resubmit(PendingAddressCheck $row, ?SaasRequestException $platformDown = null): ?SaasRequestException
     {
+        if ($platformDown !== null && time() - $this->firstAttemptAt($row) < $this->retryWindowSeconds()) {
+            return $platformDown;
+        }
+
         $orderId   = (int) $row->orderId;
         $loadError = '';
 
@@ -210,12 +246,12 @@ class AddressCheckSubmitService
                 'error'   => $loadError !== '' ? $loadError : 'order not found',
             ]);
             $this->pendingRepo->markFailed($row, 'retry: order could not be loaded');
-            return;
+            return null;
         }
 
         // The row remembers which procedure queued it, so the retry sends what the first
         // attempt would have sent.
-        $this->attempt($order, $row, ['b2bCheck' => $this->rowRequestsB2bCheck($row)]);
+        return $this->attempt($order, $row, ['b2bCheck' => $this->rowRequestsB2bCheck($row)], $platformDown);
     }
 
     /**
@@ -227,8 +263,13 @@ class AddressCheckSubmitService
      *
      * $options['b2bCheck'] puts the flag on the item and on every row this
      * attempt creates, so a retry and the duplicate guard both see it.
+     *
+     * Returns the failure when the platform could not be reached
+     * (SaasRequestException::platformUnavailable), null otherwise, including the
+     * early exits that never called it. With $platformDown set (cron, a row past
+     * its window) nothing is sent: the row fails as that request did, which closes it.
      */
-    private function attempt(Order $order, ?PendingAddressCheck $row, array $options = []): void
+    private function attempt(Order $order, ?PendingAddressCheck $row, array $options = [], ?SaasRequestException $platformDown = null): ?SaasRequestException
     {
         $orderId     = (int) $order->id;
         $b2b = !empty($options['b2bCheck']);
@@ -241,7 +282,7 @@ class AddressCheckSubmitService
             if ($row !== null) {
                 // The key may be on its way; look again in an hour rather than every tick.
                 $nextAttemptAt = date('Y-m-d H:i:s', time() + self::RETRY_MAX_DELAY_SECONDS);
-                $this->pendingRepo->scheduleRetry($row, (int) $row->attempts, $nextAttemptAt, 'API key missing');
+                $this->pendingRepo->scheduleRetry($row, (int) $row->attempts, $nextAttemptAt, 'API key missing', (string) $row->jobId);
                 // error, not warning: a warning never shows in the Plenty log unless the
                 // merchant switches the plugin's log on, and a missing key must be seen.
                 $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.retryWaitingForConfig', [
@@ -249,7 +290,7 @@ class AddressCheckSubmitService
                     'nextAttemptAt' => $nextAttemptAt,
                 ]);
             }
-            return;
+            return null;
         }
 
         // Opt-in: a Hauptauftrag that already has Lieferaufträge is not checked, because the
@@ -262,7 +303,7 @@ class AddressCheckSubmitService
             if ($row !== null) {
                 $this->pendingRepo->markFailed($row, 'retry: skipped, order has delivery orders');
             }
-            return;
+            return null;
         }
 
         // Per-job callback token, derived from the API key the merchant already
@@ -290,7 +331,7 @@ class AddressCheckSubmitService
             if ($row !== null) {
                 $this->pendingRepo->markFailed($row, 'retry: delivery address not found');
             }
-            return;
+            return null;
         }
 
         // Resolve the order's shipping carrier so the backend can pick a
@@ -322,25 +363,55 @@ class AddressCheckSubmitService
 
         $item = $payload['items'][0];
 
-        try {
-            $jobId = $this->saasClient->submitJob($apiBaseUrl, $apiKey, $payload);
-        } catch (SaasRequestException $e) {
-            // Unreachable, 5xx or "wait": the address is fine as far as anyone knows,
-            // so the order keeps its status and the cron tries again. A refusal
-            // (bad key, empty wallet, invalid DHL credentials) will not change by
-            // asking again; the merchant has to act, and the note says what on.
-            if ($e->isRetryable()) {
-                $this->deferSubmit($orderId, $address, $row, $e, $item);
-            } else {
-                $this->rejectSubmit($orderId, $address, $row, $e, $item);
-            }
-            return;
-        } catch (Throwable $e) {
-            $this->rejectSubmit($orderId, $address, $row, $e, $item);
-            return;
+        if ($platformDown !== null) {
+            return $this->handleSubmitFailure($orderId, $address, $row, $this->notAttempted($platformDown, $row), $item);
         }
 
         $attempts = $row !== null ? (int) $row->attempts + 1 : 1;
+
+        // A job from an earlier attempt whose confirm failed (1.9.0): confirm that job
+        // instead of creating another, because the first confirm may have landed and
+        // only its answer got lost. The platform says whether the job is still usable;
+        // the plugin keeps no clock for it.
+        $openJobId = $row !== null ? (string) $row->jobId : '';
+        if ($openJobId !== '') {
+            try {
+                $confirmedStatus = $this->saasClient->confirmJob($apiBaseUrl, $apiKey, $openJobId);
+                $jobGone         = $confirmedStatus === 'CANCELLED';
+            } catch (SaasRequestException $e) {
+                $jobGone = $this->confirmFoundJobGone($e);
+                if (!$jobGone) {
+                    return $this->handleSubmitFailure($orderId, $address, $row, $e->withJobId($openJobId), $item);
+                }
+            } catch (Throwable $e) {
+                $this->rejectSubmit($orderId, $address, $row, $e, $item);
+                return null;
+            }
+
+            if (!$jobGone) {
+                $this->pendingRepo->markPending($row, $openJobId, $attempts);
+                $this->report(__METHOD__, 'HeistaAddressCheck::log.confirmRetried', [
+                    'orderId'  => $orderId,
+                    'jobId'    => $openJobId,
+                    'attempts' => $attempts,
+                ]);
+                return null;
+            }
+
+            // Cancelled after 30 minutes unconfirmed, or unknown to this key: nothing
+            // was charged for it, so this attempt creates a new job right away.
+            $this->report(__METHOD__, 'HeistaAddressCheck::log.confirmRetryJobGone', [
+                'orderId' => $orderId,
+                'jobId'   => $openJobId,
+            ]);
+        }
+
+        try {
+            $jobId = $this->saasClient->submitJob($apiBaseUrl, $apiKey, $payload);
+        } catch (Throwable $e) {
+            return $this->handleSubmitFailure($orderId, $address, $row, $e, $item);
+        }
+
         if ($row !== null) {
             $this->pendingRepo->markPending($row, $jobId, $attempts);
         } else {
@@ -360,6 +431,8 @@ class AddressCheckSubmitService
             'jobId'    => $jobId,
             'attempts' => $attempts,
         ]);
+
+        return null;
     }
 
     private function buildCallbackUrl(): string
@@ -755,21 +828,95 @@ class AddressCheckSubmitService
     }
 
     /**
+     * Whether the platform's answer to a confirm of an earlier job says that job is
+     * gone: 404 (another tenant's key, another environment) or 409 (cancelled after
+     * 30 minutes unconfirmed, the only conflict a plugin job can meet), both from
+     * the platform itself. Anything else is handled like any submit failure.
+     */
+    private function confirmFoundJobGone(SaasRequestException $e): bool
+    {
+        return $e->platformAnswered()
+            && ($e->getHttpStatus() === 404 || $e->getHttpStatus() === 409);
+    }
+
+    /**
+     * Unreachable, 5xx, "wait", or an answer from something in front of the
+     * platform: the address is fine as far as anyone knows, so the order keeps its
+     * status and the cron tries again. A refusal (bad key, empty wallet, invalid DHL
+     * credentials) will not change by asking again; the merchant has to act, and the
+     * note says what on.
+     *
+     * Returns the failure when the platform could not be reached, the signal attempt()
+     * passes on; null otherwise.
+     */
+    private function handleSubmitFailure(int $orderId, Address $address, ?PendingAddressCheck $row, Throwable $e, array $item): ?SaasRequestException
+    {
+        if ($e instanceof SaasRequestException && $e->isRetryable()) {
+            $this->deferSubmit($orderId, $address, $row, $e, $item);
+            return $e->platformUnavailable() ? $e : null;
+        }
+
+        $this->rejectSubmit($orderId, $address, $row, $e, $item);
+        return null;
+    }
+
+    /** The configured retry window in seconds; an unknown value falls back to the default. */
+    private function retryWindowSeconds(): int
+    {
+        $hours = (int) $this->config->get('HeistaAddressCheck.retryWindowHours', (string) self::RETRY_WINDOW_HOURS_DEFAULT);
+        if (!in_array($hours, self::RETRY_WINDOW_HOURS_ALLOWED, true)) {
+            $hours = self::RETRY_WINDOW_HOURS_DEFAULT;
+        }
+
+        return $hours * 3600;
+    }
+
+    /** Unix time of the row's first submit attempt; now for a new row or an unreadable date. */
+    private function firstAttemptAt(?PendingAddressCheck $row): int
+    {
+        $since = $row !== null && $row->submittedAt !== '' ? (int) strtotime($row->submittedAt) : 0;
+
+        return $since > 0 ? $since : time();
+    }
+
+    /**
+     * The failure a cron row is closed with when an earlier request of the same run
+     * found the platform out of reach: the same status and answer, the row's own job
+     * id, and a message that says it was not sent.
+     */
+    private function notAttempted(SaasRequestException $seen, ?PendingAddressCheck $row): SaasRequestException
+    {
+        $e = new SaasRequestException(
+            'not sent, platform unreachable earlier in this cron run: ' . $seen->getMessage(),
+            $seen->getHttpStatus(),
+            $seen->getRetryAfterSeconds(),
+            $seen->getErrorCode(),
+            $seen->platformAnswered()
+        );
+
+        return $e->withJobId($row !== null ? (string) $row->jobId : '');
+    }
+
+    /**
      * The platform could not be reached, failed on its side or asked us to wait.
      * Park the order for another attempt; its status stays untouched, because
      * nothing is known about the address yet. Once the retry window is used up,
      * give up the way a refusal is handled: FAILED row, error status, and a note
      * that names the attempts and the last cause, with the way to re-run it.
+     *
+     * When only the confirm failed, the exception carries the created job's id
+     * (1.9.0); it goes onto the row, so the next attempt confirms that job instead
+     * of creating another.
      */
     private function deferSubmit(int $orderId, Address $address, ?PendingAddressCheck $row, SaasRequestException $e, array $item): void
     {
+        $keepJobId      = $e->getJobId();
         $attempts       = ($row !== null ? (int) $row->attempts : 0) + 1;
-        $firstAttemptAt = $row !== null && $row->submittedAt !== '' ? (int) strtotime($row->submittedAt) : 0;
-        if ($firstAttemptAt <= 0) {
-            $firstAttemptAt = time();
-        }
+        $firstAttemptAt = $this->firstAttemptAt($row);
 
-        if (time() - $firstAttemptAt >= self::RETRY_WINDOW_SECONDS) {
+        $windowSeconds = $this->retryWindowSeconds();
+
+        if (time() - $firstAttemptAt >= $windowSeconds) {
             $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.submitGivenUp', [
                 'orderId'        => $orderId,
                 'attempts'       => $attempts,
@@ -795,7 +942,7 @@ class AddressCheckSubmitService
         if ($row === null) {
             $this->pendingRepo->create([
                 'orderId'           => $orderId,
-                'jobId'             => '',
+                'jobId'             => $keepJobId,
                 'deliveryAddressId' => (int) $address->id,
                 'status'            => PendingAddressCheck::STATUS_RETRY,
                 'submittedAt'       => date('Y-m-d H:i:s'),
@@ -805,16 +952,23 @@ class AddressCheckSubmitService
                 // The item is what was actually sent, so the retry sends the same thing.
                 'b2bCheck'  => !empty($item['b2bCheck']),
             ]);
+            // First deferral of this order (1.9.0): until now the order sat in its
+            // status with nothing on it, and the merchant could not tell it was waiting.
+            // Only here, so an outage writes one comment per order, not one per attempt.
+            $this->apply->writeSubmitDeferredNote($orderId, date('d.m.Y H:i', $firstAttemptAt + $windowSeconds));
         } else {
-            $this->pendingRepo->scheduleRetry($row, $attempts, $nextAttemptAt, $e->getMessage());
+            $this->pendingRepo->scheduleRetry($row, $attempts, $nextAttemptAt, $e->getMessage(), $keepJobId);
         }
 
         // report(), not warning(): a warning is invisible in the Plenty log until the
         // merchant activates it, and "why was this order not checked yet" is exactly
-        // the question this line answers.
+        // the question this line answers. `phase` says which call failed: a failed
+        // confirm leaves a job at the platform, a failed create does not.
         $this->report(__METHOD__, 'HeistaAddressCheck::log.submitDeferred', [
             'orderId'       => $orderId,
             'attempt'       => $attempts,
+            'phase'         => $keepJobId !== '' ? 'confirm' : 'create',
+            'jobId'         => $keepJobId,
             'httpStatus'    => $e->getHttpStatus(),
             'nextAttemptAt' => $nextAttemptAt,
             'error'         => $e->getMessage(),
@@ -878,6 +1032,9 @@ class AddressCheckSubmitService
         }
         if ($status >= 500) {
             return 'Fehler auf der Plattform (HTTP ' . $status . ')';
+        }
+        if ($status >= 400 && !$e->platformAnswered()) {
+            return 'die Plattform hat nicht geantwortet (HTTP ' . $status . ', Antwort kam nicht von der Plattform)';
         }
 
         return 'HTTP ' . $status;

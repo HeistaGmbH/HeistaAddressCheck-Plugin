@@ -8,9 +8,11 @@ use HeistaAddressCheck\Repositories\PendingAddressCheckRepository;
 use HeistaAddressCheck\Services\AddressCheckApplyService;
 use HeistaAddressCheck\Services\AddressCheckSubmitService;
 use HeistaAddressCheck\Services\SaasClient;
+use HeistaAddressCheck\Services\SaasRequestException;
 use Plenty\Modules\Cron\Contracts\CronHandler;
 use Plenty\Plugin\ConfigRepository;
 use Plenty\Plugin\Log\Loggable;
+use Plenty\Plugin\Log\Reportable;
 use Throwable;
 
 /**
@@ -23,6 +25,7 @@ use Throwable;
 class FallbackPollCron extends CronHandler
 {
     use Loggable;
+    use Reportable;
 
     private const GRACE_SECONDS  = 90;
     private const BATCH_LIMIT    = 50;
@@ -64,34 +67,52 @@ class FallbackPollCron extends CronHandler
         $devOverride = trim((string) $this->config->get('HeistaAddressCheck.devApiBaseUrlOverride'));
         $apiBaseUrl  = PlatformEnvironment::baseUrlFor($environment, $devOverride);
 
-        $this->pollStale($apiBaseUrl, $apiKey);
-        $this->resubmitDue();
+        // Once a request finds the platform out of reach, the rest of the run sends
+        // nothing (1.9.0). A platform that accepts connections and never answers costs
+        // 15 s per request, and 50 polls plus 100 resubmits would hold one run for over
+        // half an hour, far past the five-minute slot. Queued rows still go through
+        // resubmit() with that failure, so a row whose waiting time has run out is
+        // closed on time; the others keep their schedule for the next run.
+        $platformDown = $this->pollStale($apiBaseUrl, $apiKey);
+        $this->resubmitDue($platformDown);
     }
 
     /**
      * Orders queued because the platform could not be reached. The submit
      * service decides per row whether to try, wait longer or give up; this loop
-     * only guarantees that one bad row cannot stop the others.
+     * only guarantees that one bad row cannot stop the others, and carries an
+     * unreachable platform from one row to the next.
      */
-    private function resubmitDue(): void
+    private function resubmitDue(?SaasRequestException $platformDown): void
     {
         foreach ($this->pendingRepo->findRetryDue(self::RESUBMIT_LIMIT) as $row) {
             try {
-                $this->submitService->resubmit($row);
+                $seen = $this->submitService->resubmit($row, $platformDown);
             } catch (Throwable $e) {
                 $this->getLogger(__METHOD__)->error('HeistaAddressCheck::log.cronResubmitFailed', [
                     'orderId' => (int) $row->orderId,
                     'error'   => $e->getMessage(),
                 ]);
+                continue;
+            }
+
+            if ($platformDown === null && $seen !== null) {
+                $platformDown = $seen;
+                $this->reportPlatformUnavailable('resubmit', $seen);
             }
         }
     }
 
-    private function pollStale(string $apiBaseUrl, string $apiKey): void
+    /**
+     * Returns the failure when a poll found the platform out of reach, and polls no
+     * further in this run; null otherwise. A poll that fails for one job (a 404 for a
+     * purged one, say) does not stop the others.
+     */
+    private function pollStale(string $apiBaseUrl, string $apiKey): ?SaasRequestException
     {
         $rows = $this->pendingRepo->findStalePending(self::GRACE_SECONDS, self::BATCH_LIMIT);
         if (empty($rows)) {
-            return;
+            return null;
         }
 
         foreach ($rows as $row) {
@@ -107,17 +128,38 @@ class FallbackPollCron extends CronHandler
                     'jobId' => $jobId,
                     'error' => $e->getMessage(),
                 ]);
+                if ($e instanceof SaasRequestException && $e->platformUnavailable()) {
+                    $this->reportPlatformUnavailable('poll', $e);
+                    return $e;
+                }
                 continue;
             }
 
             $status = (string) ($body['status'] ?? '');
-            if ($status === 'COMPLETED') {
+            // FAILED goes through apply() as well, which writes the note and sets the
+            // error status the way the callback path does. Until 1.9.0 the poll only
+            // closed the row, so an order whose result came by poll stayed in its
+            // trigger status with no word on it. Since the confirm retry, a job whose
+            // start failed on the platform reaches the plugin by this route.
+            if ($status === 'COMPLETED' || $status === 'FAILED') {
                 $this->safeApply($jobId, $body);
-            } elseif ($status === 'FAILED') {
-                $this->pendingRepo->markFailed($row, 'SaaS job FAILED');
             }
             // Anything else (PENDING/PROCESSING/AWAITING_EXTERNAL): retry next tick.
         }
+
+        return null;
+    }
+
+    /**
+     * One line per run that met an unreachable platform, as report() so it shows
+     * without the merchant switching the plugin log on.
+     */
+    private function reportPlatformUnavailable(string $phase, SaasRequestException $e): void
+    {
+        $this->report(__METHOD__, 'HeistaAddressCheck::log.cronPlatformUnavailable', [
+            'phase' => $phase,
+            'error' => $e->getMessage(),
+        ]);
     }
 
     private function safeApply(string $jobId, array $body): void
